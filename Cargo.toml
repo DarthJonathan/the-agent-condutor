@@ -1,0 +1,28 @@
+[package]
+name = "agent-conductor"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "A native Rust dashboard for headless AI agents"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "6"
+eframe = { version = "0.33.3", default-features = false, features = ["default_fonts", "glow", "accesskit", "x11", "wayland"] }
+futures-util = "0.3"
+image = { version = "0.25", default-features = false, features = ["png"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "process", "io-util", "io-std", "time", "sync", "macros", "net"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+tempfile = "3"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[profile.release]
+lto = "thin"
+strip = true

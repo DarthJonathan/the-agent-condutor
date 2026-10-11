@@ -1,0 +1,6 @@
+/target/
+/dist/
+/.conductor/
+*.log
+.DS_Store
+.env
