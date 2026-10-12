@@ -44,7 +44,7 @@ xcrun swiftc -swift-version 5 -warnings-as-errors \
   -target "$conductor_arch-apple-macosx14.0" \
   -module-cache-path target/swift-module-cache \
   "${conductor_swift_options[@]}" \
-  macos/Models.swift macos/MentionEditor.swift macos/EngineStore.swift macos/Views.swift macos/ConductorApp.swift \
+  macos/Models.swift macos/NativeResponseText.swift macos/MentionEditor.swift macos/EngineStore.swift macos/Views.swift macos/ConductorApp.swift \
   -o "$conductor_bundle/Contents/MacOS/agent-conductor"
 cat > "$conductor_bundle/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -56,8 +56,8 @@ cat > "$conductor_bundle/Contents/Info.plist" <<'PLIST'
   <key>CFBundleExecutable</key><string>agent-conductor</string>
   <key>CFBundleIconFile</key><string>AppIcon.icns</string>
   <key>CFBundleIdentifier</key><string>dev.agentconductor.desktop</string>
-  <key>CFBundleVersion</key><string>1</string>
-  <key>CFBundleShortVersionString</key><string>0.1.0</string>
+  <key>CFBundleVersion</key><string>5</string>
+  <key>CFBundleShortVersionString</key><string>0.1.4</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSPrincipalClass</key><string>NSApplication</string>

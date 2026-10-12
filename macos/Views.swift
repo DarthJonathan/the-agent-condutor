@@ -391,7 +391,7 @@ private struct WorkspaceChatView: View {
                 Divider()
                 if let run {
                     if preview { ConversationMessages(run: run).frame(maxHeight: .infinity, alignment: .top) }
-                    else { ConversationTranscript(run: run).frame(maxWidth: .infinity, maxHeight: .infinity) }
+                    else { ConversationTranscript(run: run).id(run.id).frame(maxWidth: .infinity, maxHeight: .infinity) }
                 } else {
                     VStack(spacing: 14) {
                         if loading { ProgressView("Opening conversation…") }
@@ -447,46 +447,116 @@ private struct WorkspaceChatView: View {
 
 private struct ConversationTranscript: View {
     @EnvironmentObject private var store: EngineStore
+    @State private var following: Task<Void, Never>?
+    @State private var followState = TranscriptFollowState()
     let run: RunRecord
     var body: some View {
         ScrollViewReader { proxy in
             ScrollView {
                 ConversationMessages(run: run)
-                Color.clear.frame(height: 1).id("chat-end")
+                    .background(TranscriptScrollObserver { event in
+                        following?.cancel(); following = nil
+                        switch event {
+                        case .began: store.setTranscriptScrolling(true); followState.begin()
+                        case .moved(let nearBottom): followState.moved(nearBottom: nearBottom)
+                        case .ended(let nearBottom): store.setTranscriptScrolling(false); followState.end(nearBottom: nearBottom)
+                        }
+                        if followState.canFollow { followBottom(proxy) }
+                    }.frame(width: 0, height: 0))
             }
-            .onAppear { if let id = store.focusedMessageID { proxy.scrollTo(id, anchor: .top) } else { proxy.scrollTo("chat-end", anchor: .bottom) } }
-            .onChange(of: store.focusedMessageID) { _, id in if let id { proxy.scrollTo(id, anchor: .top) } }
-            .onChange(of: run.conversation?.messages.count) { _, _ in if store.focusedMessageID == nil { proxy.scrollTo("chat-end", anchor: .bottom) } }
-            .onChange(of: run.conversation?.messages.last?.text.count) { _, _ in if run.status.active { proxy.scrollTo("chat-end", anchor: .bottom) } }
-            .onChange(of: run.status) { _, status in if status == .waitingForUser { proxy.scrollTo("chat-end", anchor: .bottom) } }
+            .overlay(alignment: .bottomTrailing) {
+                if !followState.following {
+                    Button {
+                        store.focusedMessageID = nil
+                        followState.jumpToLatest()
+                        followBottom(proxy)
+                    } label: { Label("Latest", systemImage: "arrow.down.circle") }
+                        .buttonStyle(.bordered).padding(12)
+                }
+            }
+            .onAppear {
+                if let id = store.focusedMessageID { followState.end(nearBottom: false); proxy.scrollTo(id, anchor: .top) }
+                else { followBottom(proxy) }
+            }
+            .onChange(of: store.focusedMessageID) { _, id in
+                if let id { following?.cancel(); following = nil; followState.end(nearBottom: false); proxy.scrollTo(id, anchor: .top) }
+            }
+            .onChange(of: run.conversation?.messages.count) { _, _ in followBottom(proxy) }
+            .onChange(of: run.conversation?.messages.last?.text.count) { _, _ in if run.status.active { followBottom(proxy) } }
+            .onChange(of: run.conversation?.messages.last?.reasoning?.count) { _, _ in if run.status.active { followBottom(proxy) } }
+            .onChange(of: run.status) { _, _ in followBottom(proxy) }
+            .onDisappear { following?.cancel(); following = nil; store.setTranscriptScrolling(false) }
+        }
+    }
+    // Coalesce requests until layout settles. A user scroll takes priority and
+    // streaming resumes following only after the reader returns to the bottom.
+    private func followBottom(_ proxy: ScrollViewProxy) {
+        guard following == nil, followState.canFollow, store.focusedMessageID == nil else { return }
+        following = Task { @MainActor in
+            do { try await Task.sleep(nanoseconds: 150_000_000) } catch { return }
+            if followState.canFollow && store.focusedMessageID == nil { proxy.scrollTo("chat-end", anchor: .bottom) }
+            following = nil
         }
     }
 }
 
 private struct ConversationMessages: View {
+    @EnvironmentObject private var store: EngineStore
     let run: RunRecord
     var body: some View {
-        LazyVStack(alignment: .leading, spacing: 16) {
-            ForEach(run.conversation?.messages ?? []) { message in ChatMessageView(runID: run.id, message: message, conversation: run.conversation).id(message.id) }
+        // Keep measured card heights stable while the viewport moves. Native
+        // text views handle long answers without hundreds of SwiftUI nodes.
+        VStack(alignment: .leading, spacing: 16) {
+            ForEach(run.conversation?.messages ?? []) { message in
+                ChatMessageView(runID: run.id,
+                                presentation: ChatMessagePresentation(message: message, conversation: run.conversation,
+                                                                      blocks: store.renderedChat[message.id] ?? []), store: store)
+                    .equatable().id(message.id)
+            }
+            Color.clear.frame(height: 1).id("chat-end")
         }.frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
-private struct ChatMessageView: View {
-    @EnvironmentObject private var store: EngineStore
-    let runID: String
+// A completed card depends only on its own contents and names, not the growing
+// conversation or the store's streaming publications. Controls inside question
+// and approval cards observe the store separately to remain responsive.
+struct ChatMessagePresentation: Equatable {
     let message: ChatMessage
-    let conversation: TaskConversation?
+    let blocks: [ResponseBlock]
+    let authorName: String
+    let providerLabel: String?
+    let recipients: [String]
+    init(message: ChatMessage, conversation: TaskConversation?, blocks: [ResponseBlock]) {
+        self.message = message; self.blocks = blocks
+        let name = conversation?.coworker(message.authorId)?.name ?? message.author.map { conversation?.identity($0).name ?? $0.name } ?? message.authorLabel
+        authorName = name
+        providerLabel = message.author.flatMap { name != $0.name ? $0.name : nil }
+        if let ids = message.recipientIds, !ids.isEmpty { recipients = ids.map { conversation?.coworker($0)?.name ?? "Coworker" } }
+        else { recipients = message.to.map { conversation?.identity($0).name ?? $0.name } }
+    }
+}
+
+private struct ChatMessageView: View, Equatable {
+    let runID: String
+    let presentation: ChatMessagePresentation
+    let store: EngineStore
     @State private var expanded = false
-    private var authorName: String { conversation?.coworker(message.authorId)?.name ?? message.author.map { conversation?.identity($0).name ?? $0.name } ?? message.authorLabel }
-    private var recipients: [String] { if let ids = message.recipientIds, !ids.isEmpty { return ids.map { conversation?.coworker($0)?.name ?? "Coworker" } }; return message.to.map { conversation?.identity($0).name ?? $0.name } }
+    static func == (lhs: Self, rhs: Self) -> Bool { lhs.runID == rhs.runID && lhs.store === rhs.store && lhs.presentation == rhs.presentation }
+    private var message: ChatMessage { presentation.message }
+    private var authorName: String { presentation.authorName }
+    private var recipients: [String] { presentation.recipients }
+    private var activity: [LogEntry] { visibleActivityLogs(message.logs) }
+    private var answer: some View {
+        NativeResponseText(blocks: presentation.blocks).frame(maxWidth: .infinity, alignment: .leading)
+    }
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 9) {
                 if let provider = message.author { ProviderMark(provider: provider) }
                 else { Image(systemName: message.kind == "system" ? "info.circle" : "person.crop.circle").foregroundStyle(.secondary) }
                 Text(authorName).font(.system(size: 12, weight: .semibold))
-                if let provider = message.author, conversation?.identity(provider).name != provider.name { Text(provider.name).font(.system(size: 10)).foregroundStyle(.tertiary) }
+                if let provider = presentation.providerLabel { Text(provider).font(.system(size: 10)).foregroundStyle(.tertiary) }
                 if !recipients.isEmpty { Text("→ \(recipients.joined(separator: ", "))").font(.system(size: 11)).foregroundStyle(.secondary) }
                 Spacer()
                 if message.status.active { ProgressView().controlSize(.small) }
@@ -499,34 +569,69 @@ private struct ChatMessageView: View {
             if message.teamDiscussion == true {
                 Label("Team discussion", systemImage: "bubble.left.and.bubble.right").font(.system(size: 10, weight: .medium)).foregroundStyle(Theme.accent)
             } else if message.kind == "answer" {
-                Label("Your answers", systemImage: "checkmark.bubble").font(.system(size: 10, weight: .medium)).foregroundStyle(Theme.accent)
+                Label(message.authorId == nil ? "Your answers" : "Teammate answers", systemImage: "checkmark.bubble").font(.system(size: 10, weight: .medium)).foregroundStyle(Theme.accent)
+            } else if message.kind == "question_delegation" {
+                Label("Question delegated", systemImage: "person.2").font(.system(size: 10, weight: .medium)).foregroundStyle(Theme.accent)
             } else if message.kind == "request" {
                 Label("Teammate request", systemImage: "arrow.turn.down.right").font(.system(size: 10, weight: .medium)).foregroundStyle(Theme.accent)
             } else if message.kind == "assistant" && !recipients.isEmpty {
                 Text("Teammate reply").font(.system(size: 10, weight: .medium)).foregroundStyle(.secondary)
             }
-            if let error = message.error { Text(error).font(.system(size: 12)).foregroundStyle(.red).textSelection(.enabled) }
+            if let reasoning = message.reasoning, !reasoning.isEmpty {
+                ReasoningSection(text: reasoning, provider: message.author,
+                                 working: message.status == .running && message.text.isEmpty)
+            }
+            if let error = message.error { NativeResponseText(text: error, tone: .error) }
             if message.error != message.text {
-                if message.text.isEmpty && message.questionRequest == nil { Text(message.status == .queued ? "Waiting for this agent…" : message.status == .running ? "Thinking…" : "No response text.").font(.system(size: 12)).foregroundStyle(.secondary) }
-                else {
-                    ForEach(store.renderedChat[message.id] ?? []) { block in ResponseBlockContent(block: block).equatable() }
+                if message.text.isEmpty && message.questionRequest == nil {
+                    if message.reasoning?.isEmpty != false || message.status != .running {
+                        Text(message.status == .queued ? "Waiting for this agent…" : message.status == .running ? "Thinking…" : "No response text.").font(.system(size: 12)).foregroundStyle(.secondary)
+                    }
                 }
+                else { answer }
             }
             if let request = message.questionRequest {
                 AgentQuestionCard(runID: runID, message: message, request: request,
                                   agentName: authorName)
             }
             if let request = message.approvalRequest { AgentApprovalCard(runID: runID, message: message, request: request, agentName: authorName) }
-            if !message.logs.isEmpty {
+            if !activity.isEmpty {
                 DisclosureGroup("Activity", isExpanded: $expanded) {
-                    VStack(alignment: .leading, spacing: 7) {
-                        ForEach(Array(message.logs.enumerated()), id: \.offset) { _, log in Text(log.text).font(.system(size: 11)).foregroundStyle(log.kind == "Error" ? .red : .secondary).textSelection(.enabled) }
-                    }.padding(.top, 8)
+                    NativeResponseText(text: activity.map(\.text).joined(separator: "\n\n"), size: 11, tone: .secondary).padding(.top, 8)
                 }.font(.system(size: 10)).foregroundStyle(.secondary)
             }
-        }.padding(16).frame(maxWidth: .infinity, alignment: .leading).textSelection(.enabled)
+        }.padding(16).frame(maxWidth: .infinity, alignment: .leading)
             .background(message.kind == "user" ? Theme.accent.opacity(0.065) : Theme.panel, in: RoundedRectangle(cornerRadius: 10))
             .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Theme.border))
+    }
+}
+
+struct ReasoningSection: View {
+    let text: String
+    let provider: Provider?
+    let working: Bool
+    @State private var expanded = false
+    private var title: String { provider == .codex ? "Reasoning summary" : "Thinking" }
+    private var preview: String { String(text.suffix(480)).split(whereSeparator: \.isNewline).last.map(String.init) ?? "" }
+    private var content: some View {
+        NativeResponseText(text: text, tone: .secondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+    }
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            DisclosureGroup(isExpanded: $expanded) {
+                ScrollView { content }.frame(height: 180).padding(.top, 8)
+            } label: {
+                HStack(spacing: 7) {
+                    Image(systemName: "brain")
+                    Text(title).fontWeight(.medium)
+                    Spacer(minLength: 8)
+                    if working { ProgressView().controlSize(.mini) }
+                }
+            }.font(.system(size: 11))
+            if !expanded { Text(preview).font(.system(size: 12)).lineLimit(2).frame(maxWidth: .infinity, alignment: .leading) }
+        }.foregroundStyle(.secondary).padding(12).frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.white.opacity(0.025), in: RoundedRectangle(cornerRadius: 7))
     }
 }
 
@@ -540,6 +645,15 @@ private struct AgentQuestionCard: View {
     @State private var error: String?
     private var pending: Bool { store.pendingQuestionReplies.contains(request.id) }
     private var canAnswer: Bool { store.canAnswerQuestion(runID: runID, message: message) }
+    private var assignment: MailboxDelivery? { store.questionDelegate(runID: runID, message: message) }
+    private var teammates: [Coworker] { store.questionTeammates(runID: runID, message: message) }
+    private var teammateName: String { store.selectedRun?.conversation?.coworker(assignment?.to)?.name ?? "Teammate" }
+    private var heading: String {
+        if request.answers != nil {
+            return request.answeredBy.flatMap { store.selectedRun?.conversation?.coworker($0)?.name }.map { "Answered by \($0)" } ?? "Questions answered"
+        }
+        return assignment == nil ? "\(agentName) needs your input" : "\(teammateName) is answering \(agentName)'s questions"
+    }
     private var complete: Bool {
         request.questions.allSatisfy { drafts[$0.id]?.complete == true }
             && drafts.values.reduce(0) { $0 + $1.text.utf8.count } <= 16 * 1024
@@ -549,7 +663,7 @@ private struct AgentQuestionCard: View {
         VStack(alignment: .leading, spacing: 18) {
             HStack(spacing: 8) {
                 Image(systemName: request.answers == nil ? "questionmark.bubble" : "checkmark.bubble")
-                Text(request.answers == nil ? "\(agentName) needs your input" : "Questions answered")
+                Text(heading)
                     .font(.system(size: 13, weight: .semibold))
                 Spacer()
                 if request.answers == nil { Text("\(request.questions.count) question\(request.questions.count == 1 ? "" : "s")").font(.system(size: 11)).foregroundStyle(.secondary) }
@@ -563,7 +677,7 @@ private struct AgentQuestionCard: View {
                             ForEach(question.options.filter { answer.optionIds.contains($0.id) }) { option in
                                 Label(option.label, systemImage: "checkmark.circle.fill").font(.system(size: 12)).foregroundStyle(Theme.accent)
                             }
-                            if !answer.text.isEmpty { Text(answer.text).font(.system(size: 13)).textSelection(.enabled) }
+                            if !answer.text.isEmpty { NativeResponseText(text: answer.text, size: 13) }
                         }
                     }
                 } else {
@@ -573,15 +687,35 @@ private struct AgentQuestionCard: View {
             }
             if request.answers == nil {
                 if let error { Text(error).font(.system(size: 12)).foregroundStyle(.red) }
-                HStack(spacing: 12) {
-                    Button("Skip questions") { submit(skipAll: true) }.buttonStyle(.plain).foregroundStyle(.secondary).disabled(!canAnswer)
-                    Spacer()
-                    if pending { ProgressView().controlSize(.small) }
-                    Button(pending ? "Sending…" : "Send answers to \(agentName)") { submit(skipAll: false) }
-                        .buttonStyle(.borderedProminent).disabled(!canAnswer || !complete)
+                if let assignment {
+                    HStack(spacing: 10) {
+                        if assignment.state == "delivered" || assignment.state == "queued" { ProgressView().controlSize(.small) }
+                        Text(assignment.state == "waiting_for_user" ? "\(teammateName) needs input before answering. Open their question or approval below." : assignment.state == "paused" ? "\(teammateName)'s answer is queued for continuation." : "Waiting for \(teammateName). Their answers will resume \(agentName)'s session.")
+                            .font(.system(size: 12)).foregroundStyle(.secondary)
+                        Spacer(minLength: 8)
+                        if assignment.cancellable { Button("Cancel request") { store.cancelDelivery(assignment) }.disabled(store.demo) }
+                    }
+                } else {
+                    HStack(spacing: 12) {
+                        Button("Skip questions") { submit(skipAll: true) }.buttonStyle(.plain).foregroundStyle(.secondary).disabled(!canAnswer)
+                        Spacer()
+                        Menu {
+                            ForEach(teammates) { worker in
+                                Button("\(worker.name) · \(worker.provider.name)") { error = store.delegateQuestion(runID: runID, message: message, coworkerID: worker.id) }
+                            }
+                        } label: { Label("Ask a teammate", systemImage: "person.2") }
+                            .disabled(teammates.isEmpty).fixedSize()
+                            .help("Choose another coworker to answer these questions in their own session")
+                    }
+                    HStack(spacing: 12) {
+                        Spacer()
+                        if pending { ProgressView().controlSize(.small) }
+                        Button(pending ? "Sending…" : "Send answers to \(agentName)") { submit(skipAll: false) }
+                            .buttonStyle(.borderedProminent).disabled(!canAnswer || !complete)
+                    }
+                    Text("Answer yourself, or ask a teammate. Valid answers resume \(agentName)'s session and the paused exchange.")
+                        .font(.system(size: 11)).foregroundStyle(.secondary)
                 }
-                Text("Your answers resume \(agentName)'s session and the paused team exchange.")
-                    .font(.system(size: 11)).foregroundStyle(.secondary)
             }
         }.padding(16).frame(maxWidth: .infinity, alignment: .leading)
             .background(Theme.accent.opacity(0.035), in: RoundedRectangle(cornerRadius: 9))
@@ -637,138 +771,6 @@ private struct AgentQuestionRow: View {
                     .accessibilityLabel("Your answer to \(question.question)")
             }
         }
-    }
-}
-
-struct ResponseBlockContent: View, Equatable {
-    let block: ResponseBlock
-    var body: some View {
-        switch block.kind {
-        case .heading(let level):
-            Text(block.content).font(.system(size: level == 1 ? 23 : level == 2 ? 19 : 16, weight: .semibold))
-                .frame(maxWidth: .infinity, alignment: .leading).padding(.top, 4)
-        case .text:
-            Text(block.content).font(.system(size: 13)).lineSpacing(4).frame(maxWidth: .infinity, alignment: .leading)
-        case .code(let language): MarkdownCodeBlock(text: block.text, language: language)
-        case .list: descendants(spacing: 8)
-        case .listItem(let number, let checked):
-            HStack(alignment: .top, spacing: 9) {
-                Group {
-                    if let checked {
-                        Image(systemName: checked ? "checkmark.square.fill" : "square")
-                            .foregroundStyle(checked ? Theme.accent : .secondary).accessibilityLabel(checked ? "Completed" : "Incomplete")
-                    } else { Text(number.map { "\($0)." } ?? "•").foregroundStyle(.secondary) }
-                }.font(.system(size: 13)).frame(minWidth: 20, alignment: .trailing).padding(.top, 2)
-                descendants(spacing: 8)
-            }
-        case .quote:
-            HStack(alignment: .top, spacing: 12) {
-                RoundedRectangle(cornerRadius: 2).fill(Theme.accent.opacity(0.55)).frame(width: 3)
-                descendants(spacing: 10).padding(.vertical, 3)
-            }.fixedSize(horizontal: false, vertical: true).padding(.leading, 2)
-        case .divider: Divider().padding(.vertical, 4)
-        case .table(let columns): MarkdownTableView(rows: block.children, columns: columns)
-        case .tableRow: descendants(spacing: 8)
-        case .tableCell: Text(block.content).font(.system(size: 13))
-        }
-    }
-    private func descendants(spacing: CGFloat) -> some View {
-        VStack(alignment: .leading, spacing: spacing) {
-            ForEach(block.children) { child in ResponseBlockContent(block: child).equatable() }
-        }.frame(maxWidth: .infinity, alignment: .leading)
-    }
-}
-
-private struct MarkdownCodeBlock: View {
-    @EnvironmentObject private var store: EngineStore
-    let text: String
-    let language: String?
-    private var displayText: String { text.hasSuffix("\n") ? String(text.dropLast()) : text }
-    private var naturalHeight: CGFloat { CGFloat(displayText.components(separatedBy: "\n").count) * 17 + 26 }
-    private var codeText: some View {
-        Text(verbatim: displayText).font(.system(size: 12, design: .monospaced)).lineSpacing(2)
-            .fixedSize(horizontal: true, vertical: true).padding(12)
-    }
-    var body: some View {
-        VStack(spacing: 0) {
-            HStack {
-                Text(language.flatMap { $0.isEmpty ? nil : String($0.prefix(64)) } ?? "Code").font(.system(size: 10, weight: .medium)).foregroundStyle(.secondary)
-                Spacer()
-                Button { store.copy(text) } label: { Label("Copy", systemImage: "doc.on.doc") }
-                    .font(.system(size: 10)).buttonStyle(.plain).foregroundStyle(.secondary).help("Copy code")
-            }.padding(.horizontal, 12).padding(.vertical, 8).background(Color.white.opacity(0.025))
-            Divider()
-            if naturalHeight <= 380 {
-                ViewThatFits(in: .horizontal) {
-                    codeText
-                    ScrollView(.horizontal) { codeText }.frame(height: naturalHeight)
-                }.frame(maxWidth: .infinity, alignment: .leading)
-            } else {
-                ScrollView([.horizontal, .vertical]) { codeText }.frame(height: 380)
-            }
-        }.background(Color.black.opacity(0.18), in: RoundedRectangle(cornerRadius: 8))
-            .clipShape(RoundedRectangle(cornerRadius: 8)).overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Theme.border))
-    }
-}
-
-private struct MarkdownTableHeight: PreferenceKey {
-    static let defaultValue: CGFloat = 0
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
-}
-
-private struct MarkdownTableView: View {
-    let rows: [ResponseBlock]
-    let columns: [PresentationIntent.TableColumn.Alignment]
-    @State private var contentHeight: CGFloat = 0
-    var body: some View {
-        GeometryReader { geometry in
-            let widths = columnWidths(available: geometry.size.width)
-            if widths.reduce(0, +) <= geometry.size.width + 0.5 { table(widths: widths) }
-            else { ScrollView(.horizontal) { table(widths: widths) } }
-        }.frame(height: contentHeight > 0 ? contentHeight : CGFloat(max(1, rows.count)) * 44)
-            .onPreferenceChange(MarkdownTableHeight.self) { height in
-                if height.isFinite && height > 0 && abs(contentHeight - height) > 0.5 { contentHeight = ceil(height) }
-            }
-    }
-    private func table(widths: [CGFloat]) -> some View {
-        Grid(alignment: .topLeading, horizontalSpacing: 0, verticalSpacing: 0) {
-            ForEach(Array(rows.enumerated()), id: \.element.id) { rowIndex, row in
-                GridRow {
-                    ForEach(Array(columns.enumerated()), id: \.offset) { column, alignment in
-                        let header = isHeader(row)
-                        Text(cell(row, column: column)).font(.system(size: 13, weight: header ? .semibold : .regular)).lineSpacing(3)
-                            .frame(width: max(1, widths[column] - 24), alignment: horizontalAlignment(alignment))
-                            .fixedSize(horizontal: false, vertical: true).padding(.horizontal, 12).padding(.vertical, 11)
-                            .frame(maxHeight: .infinity, alignment: .top)
-                            .background(header ? Color.white.opacity(0.055) : rowIndex % 2 == 0 ? Color.white.opacity(0.015) : .clear)
-                            .overlay(alignment: .trailing) { if column < columns.count - 1 { Rectangle().fill(Theme.border).frame(width: 1) } }
-                            .overlay(alignment: .bottom) { if rowIndex < rows.count - 1 { Rectangle().fill(Theme.border).frame(height: 1) } }
-                    }
-                }
-            }
-        }.fixedSize(horizontal: false, vertical: true).clipShape(RoundedRectangle(cornerRadius: 8))
-            .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Theme.border))
-            .background { GeometryReader { size in Color.clear.preference(key: MarkdownTableHeight.self, value: size.size.height) } }
-    }
-    private func isHeader(_ row: ResponseBlock) -> Bool { if case .tableRow(let header) = row.kind { return header }; return false }
-    private func cell(_ row: ResponseBlock, column: Int) -> AttributedString {
-        row.children.first { if case .tableCell(let index) = $0.kind { return index == column }; return false }?.content ?? AttributedString()
-    }
-    private func horizontalAlignment(_ alignment: PresentationIntent.TableColumn.Alignment) -> Alignment {
-        switch alignment { case .left: return .leading; case .center: return .center; case .right: return .trailing; @unknown default: return .leading }
-    }
-    private func columnWidths(available: CGFloat) -> [CGFloat] {
-        let natural = columns.indices.map { column in
-            let longest = rows.map { row in String(cell(row, column: column).characters).split(separator: "\n").map(\.count).max() ?? 0 }.max() ?? 0
-            return min(320, max(100, CGFloat(min(longest, 100)) * 7 + 24))
-        }
-        let total = natural.reduce(0, +)
-        let minimum = CGFloat(columns.count) * 100
-        // Wide tables scroll; narrower ones wrap cells and fill the message width.
-        guard available >= minimum, total > 0 else { return natural }
-        if total <= available { return natural.map { $0 * available / total } }
-        let flexible = max(1, total - minimum)
-        return natural.map { 100 + ($0 - 100) * (available - minimum) / flexible }
     }
 }
 
@@ -1262,20 +1264,22 @@ private struct RunDetailView: View {
     private func response(_ stage: Stage) -> some View {
         ScrollViewReader { proxy in
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 14) {
-                    if let error = stage.error { Text(error).font(.system(size: 12)).foregroundStyle(.red).padding(12).frame(maxWidth: .infinity, alignment: .leading).background(Color.red.opacity(0.07), in: RoundedRectangle(cornerRadius: 7)) }
-                    if stage.output.isEmpty {
+                VStack(alignment: .leading, spacing: 14) {
+                    if let reasoning = stage.reasoning, !reasoning.isEmpty {
+                        ReasoningSection(text: reasoning, provider: stage.provider,
+                                         working: stage.status == .running && stage.output.isEmpty)
+                    }
+                    if let error = stage.error { NativeResponseText(text: error, tone: .error).padding(12).frame(maxWidth: .infinity, alignment: .leading).background(Color.red.opacity(0.07), in: RoundedRectangle(cornerRadius: 7)) }
+                    if stage.output.isEmpty && (stage.reasoning?.isEmpty != false || stage.status != .running) {
                         HStack(spacing: 10) {
                             if stage.status == .running { ProgressView().controlSize(.small) }
                             Text(stage.status == .queued ? "Waiting for this agent’s turn…" : stage.status == .running ? "Waiting for the first response…" : "No response text. Open Timeline for details.")
                                 .font(.system(size: 12)).foregroundStyle(.secondary)
                         }.padding(.vertical, 30)
                     }
-                    ForEach(store.renderedResponses[stage.provider] ?? []) { block in
-                        ResponseBlockContent(block: block)
-                    }
+                    NativeResponseText(blocks: store.renderedResponses[stage.provider] ?? [])
                     Color.clear.frame(height: 1).id("response-end")
-                }.frame(maxWidth: .infinity, alignment: .leading).textSelection(.enabled)
+                }.frame(maxWidth: .infinity, alignment: .leading)
             }.frame(minHeight: 100, maxHeight: 340)
                 .onChange(of: stage.output.count) { _, _ in if stage.status.active { proxy.scrollTo("response-end", anchor: .bottom) } }
         }
@@ -1283,7 +1287,7 @@ private struct RunDetailView: View {
     private func timeline(_ stage: Stage) -> some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 13) {
-                ForEach(Array(stage.logs.enumerated()), id: \.offset) { _, entry in
+                ForEach(Array(visibleActivityLogs(stage.logs).enumerated()), id: \.offset) { _, entry in
                     HStack(alignment: .top, spacing: 12) {
                         Image(systemName: entry.kind == "Tool" ? "hammer" : entry.kind == "Error" ? "exclamationmark.circle" : "circle.dotted")
                             .foregroundStyle(entry.kind == "Error" ? .red : .secondary).frame(width: 15)

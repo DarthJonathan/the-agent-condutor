@@ -63,10 +63,16 @@ elif kind == "DiscussionReview": answer = "Review by " + handle + " for " + body
 else:
     answer = "Finding from " + handle + " in my own session."
 if provider == "codex":
+    print(json.dumps({"type":"item.started","item":{"id":"r1","type":"reasoning","text":""}}), flush=True)
+    print(json.dumps({"type":"item.updated","item":{"id":"r1","type":"reasoning","text":"Fixture thinking for "}}), flush=True)
+    print(json.dumps({"type":"item.completed","item":{"id":"r1","type":"reasoning","text":"Fixture thinking for " + handle}}), flush=True)
     print(json.dumps({"type":"item.completed","item":{"type":"agent_message","text":answer}}), flush=True)
     print(json.dumps({"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":5}}), flush=True)
 else:
-    print(json.dumps({"type":"assistant","message":{"content":[{"type":"text","text":answer}]}}), flush=True)
+    for _ in range(100): print(json.dumps({"type":"system","subtype":"thinking_tokens"}), flush=True)
+    print(json.dumps({"type":"stream_event","event":{"type":"message_start","message":{"id":"m1"}}}), flush=True)
+    print(json.dumps({"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Fixture thinking for " + handle}}}), flush=True)
+    print(json.dumps({"type":"assistant","message":{"id":"m1","content":[{"type":"thinking","thinking":"Fixture thinking for " + handle},{"type":"text","text":answer}]}}), flush=True)
     print(json.dumps({"type":"result","subtype":"success","result":answer,"session_id":session,"is_error":False}), flush=True)
 '''
 paths = {}
@@ -144,6 +150,10 @@ assert [m["author_id"] for m in answers] == [TEAM[1]["id"], TEAM[2]["id"], TEAM[
 assert answers[0]["session_id"] == answers[2]["session_id"] != answers[1]["session_id"]
 assert [m["model"] for m in answers] == ["fixture-a", "fixture-b", "fixture-a"]
 assert [m["effort"] for m in answers] == ["low", "high", "low"]
+assert [m["reasoning"] for m in answers] == ["Fixture thinking for alex", "Fixture thinking for noah", "Fixture thinking for alex"]
+assert all(sum(log["text"] == "Thinking…" for log in m["logs"]) == 1 for m in answers)
+assert all("thinking_tokens" not in log["text"] for m in answers for log in m["logs"])
+assert all("Fixture thinking for " not in json.loads(line)["body"] for line in CALLS.read_text().splitlines())
 assert run["changes"]["files"][0]["owner_id"] == TEAM[1]["id"]
 assert all(m["state"] == "completed" for m in run["conversation"]["mailbox"])
 assert any(m["kind"] == "reply" and m["reply_to"] for m in run["conversation"]["mailbox"])
@@ -257,5 +267,7 @@ if "--prepare-swift" in sys.argv:
     b.chat("@alex ASK_APPROVAL", shared["id"], lead=fresh_team[1]["id"])
     b.finish(shared["id"], "WaitingForUser")
 b.close()
-print("Team smoke passed: duplicate connections, independent models/efforts/sessions, mailbox routing/cancellation/bounds, durable questions, approval decisions, real checks, isolation and deliberate sharing.")
+saved = next(r for r in json.loads((DATA / "state" / "runs.json").read_text()) if r["id"] == fresh_id)
+assert [m["reasoning"] for m in saved["conversation"]["messages"] if m["kind"] == "assistant"] == [m["reasoning"] for m in fresh["conversation"]["messages"] if m["kind"] == "assistant"]
+print("Team smoke passed: duplicate connections, independent models/efforts/sessions, persisted thinking separate from answers, mailbox routing/cancellation/bounds, durable questions, approval decisions, real checks, isolation and deliberate sharing.")
 print("Team fixture data: " + str(DATA / "state"))

@@ -41,6 +41,8 @@ pub struct QuestionRequest {
     pub id: Uuid,
     pub questions: Vec<UserQuestion>,
     pub answers: Option<Vec<QuestionAnswer>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answered_by: Option<Uuid>,
 }
 
 impl QuestionRequest {
@@ -80,6 +82,7 @@ impl QuestionRequest {
             id: Uuid::new_v4(),
             questions: input.questions,
             answers: None,
+            answered_by: None,
         })
     }
 
@@ -135,6 +138,10 @@ impl QuestionRequest {
     }
 
     pub fn answer_text(&self, answers: &[QuestionAnswer]) -> String {
+        self.answer_text_from(answers, None)
+    }
+
+    pub fn answer_text_from(&self, answers: &[QuestionAnswer], coworker: Option<&str>) -> String {
         let mut text = String::from("Answers to your questions:\n");
         for question in &self.questions {
             let Some(answer) = answers.iter().find(|a| a.question_id == question.id) else {
@@ -143,7 +150,7 @@ impl QuestionRequest {
             };
             text.push_str(&format!("\n{}\n", question.question));
             if answer.skipped {
-                text.push_str("Skipped by the user. Continue with your best judgment; do not repeat this question.\n");
+                text.push_str(&format!("Skipped by {}. Continue with your best judgment; do not repeat this question.\n", coworker.unwrap_or("the user")));
             } else {
                 for option in question
                     .options
@@ -153,7 +160,7 @@ impl QuestionRequest {
                     text.push_str(&format!("Selected: {}\n", option.label));
                 }
                 if !answer.text.is_empty() {
-                    text.push_str(&format!("User answer: {}\n", answer.text));
+                    text.push_str(&format!("{} answer: {}\n", coworker.unwrap_or("User"), answer.text));
                 }
             }
         }
@@ -184,12 +191,51 @@ impl QuestionRequest {
             }
         }
         if let Some(answers) = &self.answers {
-            text.push_str(&self.answer_text(answers));
+            text.push_str(&self.answer_text_from(answers, self.answered_by.map(|_| "Teammate")));
         } else {
             text.push_str("\n*Waiting for your answer.*\n");
         }
         text
     }
+}
+
+/// Only an explicit, unfenced envelope for this request can resolve its choices.
+pub fn extract_answers(output: &str, request: &QuestionRequest) -> Result<(String, Vec<QuestionAnswer>)> {
+    #[derive(Deserialize)]
+    struct Reply {
+        request_id: Uuid,
+        answers: Vec<QuestionAnswer>,
+    }
+    let mut remaining = output;
+    let mut visible = String::new();
+    let mut fenced = false;
+    let mut answers = None;
+    while !remaining.is_empty() {
+        let end = remaining.find('\n').map_or(remaining.len(), |i| i + 1);
+        let line = &remaining[..end];
+        if line.trim_start().starts_with("```") || line.trim_start().starts_with("~~~") {
+            fenced = !fenced;
+        }
+        if !fenced && line.trim() == "<conductor-answer>" {
+            if answers.is_some() { bail!("Return one answer envelope for the delegated questions."); }
+            let close = remaining[end..].find("</conductor-answer>")
+                .ok_or_else(|| anyhow::anyhow!("The teammate's answer envelope was incomplete."))?;
+            let body = &remaining[end..end + close];
+            let tail = &remaining[end + close..];
+            let close_end = tail.find('\n').map_or(tail.len(), |i| i + 1);
+            if body.len() > 64 * 1024 || !body.ends_with('\n') || tail[..close_end].trim() != "</conductor-answer>" {
+                bail!("Use a complete answer envelope on its own lines, below 64 KiB.");
+            }
+            let reply: Reply = serde_json::from_str(body)?;
+            if reply.request_id != request.id { bail!("The teammate answered a different question request."); }
+            answers = Some(request.validate_answers(&reply.answers)?);
+            remaining = &tail[close_end..];
+            continue;
+        }
+        visible.push_str(line);
+        remaining = &remaining[end..];
+    }
+    Ok((visible.trim().into(), answers.ok_or_else(|| anyhow::anyhow!("The teammate did not return structured answers. The questions remain open."))?))
 }
 
 /// Explicit own-line envelopes only. Examples, quotes, malformed JSON and partial blocks stay text.

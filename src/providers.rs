@@ -1,5 +1,5 @@
 //! Translate each provider's wire format into one dashboard event vocabulary.
-use crate::model::{LogKind, MAX_OUTPUT_BYTES, Provider, Usage, clip};
+use crate::model::{LogKind, MAX_OUTPUT_BYTES, MAX_REASONING_BYTES, Provider, Usage, clip};
 use anyhow::{Result, bail};
 use serde_json::Value;
 
@@ -7,6 +7,8 @@ use serde_json::Value;
 pub enum Update {
     TextDelta(String),
     Output(String),
+    // Only text supplied by the provider for display; never signatures or encrypted blocks.
+    Reasoning(String),
     Log(LogKind, String),
     Session(String),
     Usage(Usage),
@@ -17,6 +19,9 @@ pub struct Decoder {
     provider: Provider,
     partial_message: bool,
     reasoning_reported: bool,
+    reasoning_blocks: Vec<(String, String)>,
+    claude_message_id: Option<String>,
+    claude_message_sequence: usize,
     pub final_response: Option<String>,
     pub terminal_seen: bool,
     pub error: Option<String>,
@@ -31,6 +36,9 @@ impl Decoder {
             provider,
             partial_message: false,
             reasoning_reported: false,
+            reasoning_blocks: vec![],
+            claude_message_id: None,
+            claude_message_sequence: 0,
             final_response: None,
             terminal_seen: false,
             error: None,
@@ -80,9 +88,12 @@ impl Decoder {
                 self.terminal_seen = true;
                 out.push(Update::Error(error_text(v.get("error").unwrap_or(v))));
             }
-            "item.started" | "item.completed" => {
+            "item.started" | "item.updated" | "item.completed" => {
                 let item = &v["item"];
                 let completed = string(v, "type") == "item.completed";
+                if string(v, "type") == "item.updated" && string(item, "type") != "reasoning" {
+                    return;
+                }
                 match string(item, "type") {
                     "agent_message" if completed => {
                         if let Some(text) = item["text"].as_str() {
@@ -118,7 +129,12 @@ impl Decoder {
                         LogKind::Tool,
                         format!("Search: {}", string(item, "query")),
                     )),
-                    "reasoning" => self.reasoning(out),
+                    "reasoning" => self.reasoning_text(
+                        &format!("codex:{}", string(item, "id")),
+                        string(item, "text"),
+                        false,
+                        out,
+                    ),
                     _ => out.push(Update::Log(
                         LogKind::Info,
                         format!("{} · {}", string(v, "type"), string(item, "type")),
@@ -137,6 +153,10 @@ impl Decoder {
             "system" => {
                 session(v, "session_id", out);
                 let subtype = string(v, "subtype");
+                if subtype == "thinking_tokens" {
+                    self.reasoning(out);
+                    return;
+                }
                 out.push(Update::Log(
                     if subtype == "permission_denied" {
                         LogKind::Warning
@@ -151,16 +171,41 @@ impl Decoder {
                 ));
             }
             "stream_event" => {
+                if v.get("parent_tool_use_id").is_some_and(|id| !id.is_null()) {
+                    return;
+                }
                 let event = &v["event"];
                 if string(event, "type") == "message_start" {
                     self.partial_message = false;
+                    self.claude_message_id = None;
+                    self.claude_message_key(&event["message"]);
+                }
+                if string(&event["content_block"], "type") == "thinking" {
+                    let key = format!(
+                        "{}:{}",
+                        self.claude_message_key(&Value::Null),
+                        event["index"].as_u64().unwrap_or(0)
+                    );
+                    self.reasoning_text(
+                        &key,
+                        string(&event["content_block"], "thinking"),
+                        false,
+                        out,
+                    );
                 }
                 match string(&event["delta"], "type") {
                     "text_delta" => {
                         self.partial_message = true;
                         out.push(Update::TextDelta(string(&event["delta"], "text").into()));
                     }
-                    "thinking_delta" => self.reasoning(out),
+                    "thinking_delta" => {
+                        let key = format!(
+                            "{}:{}",
+                            self.claude_message_key(&Value::Null),
+                            event["index"].as_u64().unwrap_or(0)
+                        );
+                        self.reasoning_text(&key, string(&event["delta"], "thinking"), true, out);
+                    }
                     _ => {}
                 }
                 if string(&event["content_block"], "type") == "tool_use" {
@@ -181,7 +226,7 @@ impl Decoder {
                 }
                 let message = v.get("message").unwrap_or(v);
                 if let Some(content) = message["content"].as_array() {
-                    for block in content {
+                    for (index, block) in content.iter().enumerate() {
                         match string(block, "type") {
                             "text" if !self.partial_message => out
                                 .push(Update::TextDelta(format!("{}\n\n", string(block, "text")))),
@@ -213,13 +258,17 @@ impl Decoder {
                                 LogKind::Tool,
                                 format!("Tool: {} · {}", string(block, "name"), block["input"]),
                             )),
-                            "thinking" => self.reasoning(out),
+                            "thinking" => {
+                                let key = format!("{}:{index}", self.claude_message_key(message));
+                                self.reasoning_text(&key, string(block, "thinking"), false, out);
+                            }
                             _ => {}
                         }
                     }
                 } else if let Some(content) = message["content"].as_str() {
                     out.push(Update::TextDelta(content.into()));
                 }
+                self.claude_message_id = None;
             }
             "user" => {
                 if v.get("parent_tool_use_id").is_some_and(|id| !id.is_null()) {
@@ -300,7 +349,9 @@ impl Decoder {
                             out.push(Update::TextDelta(text.into()));
                         }
                     }
-                    "agent_thought_chunk" => self.reasoning(out),
+                    "agent_thought_chunk" if string(&update["content"], "type") == "text" => {
+                        self.reasoning_text("kiro", string(&update["content"], "text"), true, out);
+                    }
                     "tool_call" | "tool_call_update" => out.push(Update::Log(
                         LogKind::Tool,
                         format!(
@@ -400,11 +451,8 @@ impl Decoder {
         if let Some(delta) = v["choices"][0]["delta"]["content"].as_str() {
             out.push(Update::TextDelta(delta.into()));
         }
-        if v["choices"][0]["delta"]["reasoning_content"]
-            .as_str()
-            .is_some_and(|s| !s.is_empty())
-        {
-            self.reasoning(out);
+        if let Some(text) = v["choices"][0]["delta"]["reasoning_content"].as_str() {
+            self.reasoning_text("deepseek", text, true, out);
         }
         if let Some(reason) = v["choices"][0]["finish_reason"].as_str()
             && matches!(
@@ -421,9 +469,75 @@ impl Decoder {
 
     fn reasoning(&mut self, out: &mut Vec<Update>) {
         if !self.reasoning_reported {
-            out.push(Update::Log(LogKind::Info, "Agent is reasoning".into()));
+            out.push(Update::Log(LogKind::Info, "Thinking…".into()));
             self.reasoning_reported = true;
         }
+    }
+
+    fn claude_message_key(&mut self, message: &Value) -> String {
+        if let Some(id) = &self.claude_message_id {
+            return id.clone();
+        }
+        self.claude_message_sequence += 1;
+        let id = if let Some(id) = message["id"].as_str() {
+            format!("claude:{}", clip(id, 256))
+        } else {
+            format!("claude-message-{}", self.claude_message_sequence)
+        };
+        self.claude_message_id = Some(id.clone());
+        id
+    }
+
+    fn reasoning_text(&mut self, key: &str, text: &str, append: bool, out: &mut Vec<Update>) {
+        self.reasoning(out);
+        if text.is_empty() {
+            return;
+        }
+        let key = clip(key, 320);
+        let index = match self.reasoning_blocks.iter().position(|(id, _)| id == &key) {
+            Some(index) => index,
+            None => {
+                let used: usize = self
+                    .reasoning_blocks
+                    .iter()
+                    .map(|(_, text)| text.len() + 2)
+                    .sum();
+                if self.reasoning_blocks.len() >= 128 || used >= MAX_REASONING_BYTES {
+                    return;
+                }
+                self.reasoning_blocks.push((key, String::new()));
+                self.reasoning_blocks.len() - 1
+            }
+        };
+        let other_bytes = self
+            .reasoning_blocks
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != index)
+            .map(|(_, (_, text))| text.len())
+            .sum::<usize>()
+            + self.reasoning_blocks.len().saturating_sub(1) * 2;
+        let limit = MAX_REASONING_BYTES.saturating_sub(other_bytes);
+        let current = &self.reasoning_blocks[index].1;
+        let next = if append {
+            if current.len() >= limit {
+                return;
+            }
+            format!("{current}{}", clip(text, limit - current.len()))
+        } else {
+            clip(text, limit)
+        };
+        if next == *current {
+            return;
+        }
+        self.reasoning_blocks[index].1 = next;
+        out.push(Update::Reasoning(
+            self.reasoning_blocks
+                .iter()
+                .map(|(_, text)| text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+        ));
     }
 }
 
@@ -519,6 +633,127 @@ impl SseDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn token_heartbeats_are_one_status_not_activity_spam() {
+        let mut decoder = Decoder::new(Provider::Claude);
+        let updates: Vec<_> = (0..1000)
+            .flat_map(|_| {
+                decoder.value(&serde_json::json!({"type":"system", "subtype":"thinking_tokens"}))
+            })
+            .collect();
+        assert_eq!(
+            updates,
+            vec![Update::Log(LogKind::Info, "Thinking…".into())]
+        );
+    }
+
+    #[test]
+    fn claude_streamed_thinking_and_final_snapshots_do_not_duplicate() {
+        let mut decoder = Decoder::new(Provider::Claude);
+        decoder.value(&serde_json::json!({"type":"stream_event", "event":{"type":"message_start", "message":{"id":"m1"}}}));
+        decoder.value(&serde_json::json!({"type":"stream_event", "event":{"type":"content_block_start", "index":0, "content_block":{"type":"thinking", "thinking":""}}}));
+        let mut updates = vec![];
+        for text in ["Inspect ", "the change."] {
+            updates.extend(decoder.value(&serde_json::json!({"type":"stream_event", "event":{"type":"content_block_delta", "index":0, "delta":{"type":"thinking_delta", "thinking":text}}})));
+        }
+        assert!(updates.contains(&Update::Reasoning("Inspect the change.".into())));
+        let final_updates = decoder.value(&serde_json::json!({"type":"assistant", "message":{"id":"m1", "content":[{"type":"thinking", "thinking":"Inspect the change.", "signature":"not-displayable"}, {"type":"text", "text":"Done"}]}}));
+        assert_eq!(final_updates, vec![Update::TextDelta("Done\n\n".into())]);
+        let next = decoder.value(&serde_json::json!({"type":"assistant", "message":{"id":"m2", "content":[{"type":"thinking", "thinking":"Check tests."}]}}));
+        assert_eq!(
+            next,
+            vec![Update::Reasoning(
+                "Inspect the change.\n\nCheck tests.".into()
+            )]
+        );
+        assert!(decoder.value(&serde_json::json!({"type":"stream_event", "event":{"delta":{"type":"signature_delta", "signature":"private"}}})).is_empty());
+        assert!(decoder.value(&serde_json::json!({"type":"assistant", "message":{"content":[{"type":"redacted_thinking", "data":"encrypted"}]}})).is_empty());
+        assert!(decoder.value(&serde_json::json!({"type":"stream_event", "parent_tool_use_id":"child", "event":{"delta":{"type":"thinking_delta", "thinking":"child text"}}})).is_empty());
+    }
+
+    #[test]
+    fn full_message_thinking_works_without_partial_events() {
+        let mut decoder = Decoder::new(Provider::Qoder);
+        let updates = decoder.value(&serde_json::json!({"type":"assistant", "message":{"content":[{"type":"thinking", "thinking":"Read the workspace."}, {"type":"text", "text":"Answer"}]}}));
+        assert!(updates.contains(&Update::Reasoning("Read the workspace.".into())));
+        assert!(updates.contains(&Update::TextDelta("Answer\n\n".into())));
+    }
+
+    #[test]
+    fn codex_reasoning_items_are_revised_and_kept_separate_from_answers() {
+        let mut decoder = Decoder::new(Provider::Codex);
+        for (kind, text) in [
+            ("item.started", ""),
+            ("item.updated", "Read"),
+            ("item.updated", "Read code."),
+            ("item.completed", "Read code."),
+        ] {
+            let updates = decoder.value(
+                &serde_json::json!({"type":kind,"item":{"id":"r1","type":"reasoning","text":text}}),
+            );
+            if kind == "item.completed" {
+                assert!(updates.is_empty());
+            }
+        }
+        assert_eq!(decoder.value(&serde_json::json!({"type":"item.completed","item":{"id":"r2","type":"reasoning","text":"Check tests."}})), vec![Update::Reasoning("Read code.\n\nCheck tests.".into())]);
+        assert_eq!(decoder.value(&serde_json::json!({"type":"item.completed","item":{"id":"a1","type":"agent_message","text":"Done"}})), vec![Update::TextDelta("Done\n\n".into())]);
+        assert_eq!(decoder.final_response.as_deref(), Some("Done"));
+    }
+
+    #[test]
+    fn deepseek_and_kiro_reasoning_chunks_are_separate_and_session_scoped() {
+        let mut deepseek = Decoder::new(Provider::DeepSeek);
+        deepseek
+            .value(&serde_json::json!({"choices":[{"delta":{"reasoning_content":"Consider "}}]}));
+        let updates = deepseek.value(&serde_json::json!({"choices":[{"delta":{"reasoning_content":"options.", "content":"Answer"}}]}));
+        assert_eq!(
+            updates,
+            vec![
+                Update::TextDelta("Answer".into()),
+                Update::Reasoning("Consider options.".into())
+            ]
+        );
+        let mut kiro = Decoder::new(Provider::Kiro);
+        let chunk = |session: &str, text: &str| serde_json::json!({"type":"sessionUpdate", "data":{"sessionId":session, "update":{"sessionUpdate":"agent_thought_chunk", "content":{"type":"text", "text":text}}}});
+        kiro.value(&chunk("main", "Consider "));
+        assert!(kiro.value(&chunk("child", "unrelated")).is_empty());
+        assert!(
+            kiro.value(&chunk("main", "options."))
+                .contains(&Update::Reasoning("Consider options.".into()))
+        );
+    }
+
+    #[test]
+    fn reasoning_is_bounded_and_snapshots_can_still_be_revised() {
+        let mut decoder = Decoder::new(Provider::DeepSeek);
+        let updates = decoder.value(&serde_json::json!({"choices":[{"delta":{"reasoning_content":"世".repeat(MAX_REASONING_BYTES)}}]}));
+        let text = updates
+            .iter()
+            .find_map(|u| {
+                if let Update::Reasoning(text) = u {
+                    Some(text)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        assert!(text.len() <= MAX_REASONING_BYTES && text.ends_with('…'));
+        assert!(
+            decoder
+                .value(&serde_json::json!({"choices":[{"delta":{"reasoning_content":"more"}}]}))
+                .is_empty()
+        );
+        let mut codex = Decoder::new(Provider::Codex);
+        codex.reasoning_text("one", &"x".repeat(MAX_REASONING_BYTES), false, &mut vec![]);
+        let mut revised = vec![];
+        codex.reasoning_text("one", "Short summary", false, &mut revised);
+        assert_eq!(revised, vec![Update::Reasoning("Short summary".into())]);
+        for i in 0..200 {
+            codex.reasoning_text(&i.to_string(), "summary", false, &mut vec![]);
+        }
+        assert_eq!(codex.reasoning_blocks.len(), 128);
+    }
+
     #[test]
     fn native_clarifying_questions_are_retained_only_when_unanswered() {
         let input = serde_json::json!({"questions":[{"question":"Which approach?", "header":"Scope", "options":[{"label":"Small","description":"Focused"},{"label":"Full","description":"Complete"}], "multiSelect":false}]});

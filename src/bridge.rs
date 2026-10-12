@@ -4,7 +4,7 @@ use crate::{
     conversation::{self, ChatInput},
     model::{
         AgentEffort, AgentIdentity, AgentModel, Availability, Effort, LogKind, MAX_OUTPUT_BYTES,
-        Provider, Run, Settings, Status, clip, demo_runs,
+        MAX_REASONING_BYTES, Provider, Run, Settings, Status, clip, demo_runs,
     },
     model_catalog::{self, ModelCatalog},
     providers::Update,
@@ -53,6 +53,13 @@ enum Command {
         message_id: Uuid,
         request_id: Uuid,
         answers: Vec<crate::questions::QuestionAnswer>,
+        settings: Settings,
+    },
+    DelegateQuestion {
+        run_id: Uuid,
+        message_id: Uuid,
+        request_id: Uuid,
+        coworker_id: Uuid,
         settings: Settings,
     },
     TeamApproval {
@@ -491,6 +498,18 @@ async fn serve(data_dir: Option<PathBuf>, demo: bool) -> Result<()> {
                             Err(error) => emit(&mut output, Event::Notice { message: error.to_string(), error: true }).await?,
                         }
                     }
+                    Command::DelegateQuestion { run_id, message_id, request_id, coworker_id, settings: next } => {
+                        if demo || !active.is_empty() { emit(&mut output, Event::Notice { message: "Wait for the current exchange before asking a teammate to answer.".into(), error: true }).await?; continue; }
+                        let Some(existing) = runs.iter().find(|r| r.id == run_id) else { emit(&mut output, Event::Notice { message: "Open the saved chat before delegating its question.".into(), error: true }).await?; continue; };
+                        let prepared = team::delegate_question(existing, message_id, request_id, coworker_id).and_then(|delegated| {
+                            let lead = delegated.conversation.as_ref().and_then(|c| c.lead_id).unwrap_or_default();
+                            team::prepare(team::Input { existing: Some(&delegated), settings: &next, availability: &agents, coworkers: vec![], lead, prompt: "", discussion: false, target: None, resume_queue: true, new_run_id: None, deepseek_key: &key, claude_key: &claude_key, kiro_key: &kiro_key })
+                        });
+                        match prepared {
+                            Ok((run, plan)) => { settings = next; settings.repair(); let token = CancellationToken::new(); team_controls.insert(run_id, plan.control.clone()); active.insert(run_id, (token.clone(), tokio::spawn(team::execute(plan, emitter.clone(), token)))); runs.retain(|r| r.id != run_id); runs.insert(0, run); dirty = true; emit(&mut output, Event::RunUpdated { run: &runs[0] }).await?; },
+                            Err(error) => emit(&mut output, Event::Notice { message: error.to_string(), error: true }).await?,
+                        }
+                    }
                     Command::TeamAnswer { run_id, message_id, request_id, answers, settings: next } => {
                         if demo || !active.is_empty() { emit(&mut output, Event::Notice { message: "Wait for the current exchange before answering.".into(), error: true }).await?; continue; }
                         let Some(existing) = runs.iter().find(|r| r.id == run_id) else { continue; };
@@ -865,6 +884,7 @@ fn update_stage(stage: &mut crate::model::Stage, event: StageEvent) {
                 }
             }
             Update::Output(text) => stage.output = clip(&text, MAX_OUTPUT_BYTES),
+            Update::Reasoning(text) => stage.reasoning = clip(&text, MAX_REASONING_BYTES),
             Update::Log(kind, text) => stage.log(kind, text),
             Update::Session(id) => stage.session_id = Some(id),
             Update::Usage(usage) => stage.usage = usage,
@@ -953,6 +973,7 @@ fn apply_chat(runs: &mut [Run], event: Message) -> Option<Uuid> {
                 status: message.status,
                 session_id: message.session_id.take(),
                 output: std::mem::take(&mut message.text),
+                reasoning: std::mem::take(&mut message.reasoning),
                 logs: std::mem::take(&mut message.logs),
                 usage: std::mem::take(&mut message.usage),
                 error: message.error.take(),
@@ -974,6 +995,7 @@ fn apply_chat(runs: &mut [Run], event: Message) -> Option<Uuid> {
             message.status = stage.status;
             message.session_id = stage.session_id;
             message.text = stage.output;
+            message.reasoning = stage.reasoning;
             message.logs = stage.logs;
             message.usage = stage.usage;
             message.error = stage.error;
@@ -1001,7 +1023,7 @@ fn apply_chat(runs: &mut [Run], event: Message) -> Option<Uuid> {
             ..
         } => {
             let message = chat.messages.iter_mut().find(|m| m.id == message_id)?;
-            message.status = Status::WaitingForUser;
+            message.status = if question.as_ref().is_some_and(|q| q.answers.is_some()) && approval.is_none() { Status::Completed } else { Status::WaitingForUser };
             message.question_request = question;
             message.approval_request = approval;
         }

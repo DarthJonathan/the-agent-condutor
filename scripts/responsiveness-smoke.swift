@@ -9,6 +9,11 @@ import SwiftUI
         if CommandLine.arguments.contains("--delivery-only") { return }
         let fixture = try String(contentsOfFile: "scripts/fixtures/markdown-response.md", encoding: .utf8)
         let probe = ResponsivenessProbe(fixture: fixture)
+        if CommandLine.arguments.contains("--offscreen-scroll") {
+            NSApplication.shared.setActivationPolicy(.prohibited)
+            probe.verifyOffscreenScroll()
+            return
+        }
         if CommandLine.arguments.contains("--render-only") {
             try probe.renderLayouts()
             return
@@ -37,6 +42,59 @@ import SwiftUI
         RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.1))
         guard delivered == ["acknowledged", "token-999", "needs-answer", "notice", "finished"] else { fatalError("UI backpressure lost a control event or delivered stale streaming snapshots: \(delivered)") }
         print("UI event delivery passed: 1,000 queued snapshots coalesced; start, question, notice and completion preserved")
+        try verifyScrollDelivery(decoder: decoder)
+    }
+
+    @MainActor private static func verifyScrollDelivery(decoder: JSONDecoder) throws {
+        var received: [String] = []
+        let delivery = EventDelivery { event, _, _ in received.append(event.run?.prompt ?? event.type) }
+        func enqueue(_ text: String, status: String = "Running", id: String = "scroll-chat", messages: [[String: Any]] = []) throws {
+            let run: [String: Any] = ["id": id, "prompt": text, "workspace": "/fixture", "workflow": "Conversation", "created_at": "now", "status": status, "stages": [],
+                                      "conversation": ["members": ["claude"], "lead": "claude", "messages": messages, "sessions": []]]
+            delivery.enqueue(try decoder.decode(EngineEvent.self, from: JSONSerialization.data(withJSONObject: ["type": "run_updated", "run": run])), rendered: [:], chat: [:])
+        }
+        func settle() { RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.1)) }
+        try enqueue("seed"); settle()
+        delivery.setScrolling(true)
+        for i in 0..<1000 { try enqueue("scroll-token-\(i)") }
+        settle()
+        guard received == ["seed"] else { fatalError("Streaming text must not rebuild the chat during a live scroll") }
+        delivery.setScrolling(false); settle()
+        guard received == ["seed", "scroll-token-999"] else { fatalError("Ending a scroll must display the latest response exactly once") }
+
+        delivery.setScrolling(true)
+        try enqueue("before-question")
+        let question: [String: Any] = ["id": "ask", "at": "now", "kind": "question", "author": "claude", "to": [], "text": "Choose the scope", "status": "WaitingForUser", "model": "fixture", "logs": [], "usage": ["input_tokens": 0, "output_tokens": 0],
+                                       "question_request": ["id": "scope", "questions": [["id": "q", "header": "Scope", "question": "Which scope?", "options": [], "multi_select": false]]]]
+        try enqueue("question", messages: [question]); settle()
+        guard Array(received.suffix(2)) == ["before-question", "question"] else { fatalError("A question must be delivered immediately even when the run is still Running") }
+        let approval: [String: Any] = ["id": "approve", "at": "now", "kind": "approval", "author": "claude", "to": [], "text": "Run checks?", "status": "WaitingForUser", "model": "fixture", "logs": [], "usage": ["input_tokens": 0, "output_tokens": 0],
+                                       "approval_request": ["id": "command", "summary": "Run checks", "argv": ["cargo", "test"]]]
+        try enqueue("approval", messages: [question, approval]); settle()
+        guard received.last == "approval" else { fatalError("An approval must bypass the visual progress hold") }
+        let handoff: [String: Any] = ["id": "review", "at": "now", "kind": "assistant", "author": "codex", "to": [], "text": "", "status": "Running", "model": "fixture", "logs": [], "usage": ["input_tokens": 0, "output_tokens": 0]]
+        try enqueue("handoff", messages: [handoff]); settle()
+        guard received.last == "handoff" else { fatalError("A teammate handoff must remain visible during scrolling") }
+        try enqueue("held-review", messages: [handoff]); settle()
+        guard received.last == "handoff" else { fatalError("Only the reviewer progress should be deferred") }
+        try enqueue("cancelled", status: "Cancelled", messages: [handoff]); settle()
+        guard Array(received.suffix(2)) == ["held-review", "cancelled"] else { fatalError("Cancellation must flush the latest text before its terminal state") }
+        delivery.setScrolling(false); settle()
+        guard received.last == "cancelled" else { fatalError("Resuming delivery must never restore a stale active snapshot") }
+
+        try enqueue("first-seed", id: "first"); try enqueue("second-seed", id: "second"); settle()
+        delivery.setScrolling(true)
+        let count = received.count
+        for i in 0..<1000 { try enqueue("first-\(i)", id: "first"); try enqueue("second-\(i)", id: "second") }
+        settle()
+        guard received.count == count else { fatalError("Background runs must not compete with live scrolling") }
+        delivery.setScrolling(false); settle()
+        guard Array(received.suffix(2)) == ["first-999", "second-999"] && received.count == count + 2 else { fatalError("Multiple runs must coalesce independently without losing their latest snapshots") }
+        let before = received.count
+        for i in 0..<100 { try enqueue("paced-\(i)", id: "first"); RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.006)) }
+        settle()
+        guard received.last == "paced-99", received.count - before < 20 else { fatalError("Normal streaming must be paced while keeping the latest answer") }
+        print("Scroll delivery passed: visual progress held, latest response restored, questions/approvals/handoffs/cancellation immediate, two runs bounded and streaming paced")
     }
 }
 
@@ -62,15 +120,27 @@ import SwiftUI
                        Coworker(provider: .codex, name: "Noah", mention: "noah", role: .reviewer)]
         let usage = Usage(inputTokens: 10, outputTokens: 10, costUsd: nil)
         let at = "2026-10-11T10:00:00Z"
+        let longResponse = fixture + "\n\n" + (0..<70).map { index in
+            "### Finding \(index + 1)\n\nThe builder should keep the change scoped to the requested task, verify the affected behavior, and send the reviewer the relevant files and test results. The reviewer can reply in its own session before the lead continues."
+        }.joined(separator: "\n\n")
         for frame in 0..<60 {
             var messages: [ChatMessage] = []
-            for step in 0..<3 {
+            for step in 0..<2 {
                 messages.append(ChatMessage(id: "user-\(step)", at: at, kind: "user", author: nil, to: [], text: "Review the project and discuss the approach.", status: .completed, model: "", sessionId: nil, logs: [], usage: usage, error: nil))
-                var message = ChatMessage(id: "reply-\(step)", at: at, kind: "assistant", author: workers[step].provider, to: [], text: fixture, status: .completed, model: "fixture-model", sessionId: nil, logs: [], usage: usage, error: nil)
+                var message = ChatMessage(id: "reply-\(step)", at: at, kind: "assistant", author: workers[step].provider, to: [], text: longResponse, status: .completed, model: "fixture-model", sessionId: nil, logs: [], usage: usage, error: nil)
                 message.authorId = workers[step].id; messages.append(message)
             }
-            var active = ChatMessage(id: "stream", at: at, kind: "assistant", author: .claude, to: [], text: frame < 20 ? "" : String(fixture.prefix((frame - 19) * 65)), status: .running, model: "fixture-model", sessionId: nil, logs: [], usage: usage, error: nil)
+            var active = ChatMessage(id: "stream", at: at, kind: "assistant", author: .claude, to: [], text: frame < 10 ? "" : frame < 30 ? String(longResponse.prefix((frame - 9) * 900)) : longResponse, status: frame < 30 ? .running : .completed, model: "fixture-model", sessionId: nil, logs: [], usage: usage, error: nil)
+            active.reasoning = "Inspect the implementation and decide which coworker should review it."
             active.authorId = workers[0].id; messages.append(active)
+            if frame >= 30 {
+                var request = ChatMessage(id: "handoff", at: at, kind: "request", author: .claude, to: [.codex], text: "Please review this result.\n\n" + longResponse, status: .completed, model: "", sessionId: nil, logs: [], usage: usage, error: nil)
+                request.authorId = workers[0].id; request.recipientIds = [workers[2].id]; messages.append(request)
+                var review = ChatMessage(id: "review", at: at, kind: "assistant", author: .codex, to: [.claude], text: frame < 40 ? "" : String(longResponse.prefix((frame - 39) * 900)), status: .running, model: "fixture-reviewer", sessionId: nil, logs: [], usage: usage, error: nil)
+                review.authorId = workers[2].id; review.recipientIds = [workers[0].id]
+                review.reasoning = "Check the builder's changes against the request."
+                messages.append(review)
+            }
             var run = RunRecord(id: "fixture-chat", prompt: "Discuss the implementation", workspace: workspace, workflow: .conversation, createdAt: at, finishedAt: nil, status: .running, stages: [])
             run.conversation = TaskConversation(members: [.claude, .codex], lead: .claude, messages: messages, sessions: [], coworkers: workers, leadId: workers[0].id, mailbox: [])
             samples.append((run, Dictionary(uniqueKeysWithValues: messages.map { ($0.id, responseBlocks($0.text)) })))
@@ -84,7 +154,7 @@ import SwiftUI
         window.contentView = NSHostingView(rootView: RootView().environmentObject(store).environment(\.colorScheme, .dark).tint(Theme.accent))
         window.title = "Conductor responsiveness fixture"
         window.center(); window.orderFront(nil); self.window = window
-        print("Timing native chat layout at 1050 × 740"); fflush(stdout)
+        print("Timing native chat layout at 1050 × 740 with long responses and a teammate handoff"); fflush(stdout)
         DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.start() }
     }
     func renderLayouts() throws {
@@ -106,6 +176,59 @@ import SwiftUI
         print(String(format: "Offline layout render: %d snapshots; mean %.1f ms, maximum %.1f ms", times.count, times.reduce(0, +) / Double(times.count) * 1000, (times.max() ?? 0) * 1000))
         print("ImageRenderer omits AppKit controls; use the native window mode to check main-loop latency.")
     }
+    func verifyOffscreenScroll() {
+        let host = NSHostingView(rootView: RootView().environmentObject(store).environment(\.colorScheme, .dark).tint(Theme.accent))
+        host.frame = NSRect(x: 0, y: 0, width: 1050, height: 740)
+        // A never-ordered window gives SwiftUI a real scroll document without
+        // opening anything on the desktop or driving the user's application.
+        let hiddenWindow = NSWindow(contentRect: host.frame, styleMask: .borderless, backing: .buffered, defer: false)
+        hiddenWindow.contentView = host
+        defer { withExtendedLifetime(hiddenWindow) {} }
+        var maximum: TimeInterval = 0
+        var observedText = 0
+        var observerConnected = false
+        for frame in stride(from: 0, to: samples.count, by: 5) {
+            let (run, blocks) = samples[frame]
+            store.runs = [run.summary]; store.selectedRun = run; store.renderedChat = blocks
+            let begin = ProcessInfo.processInfo.systemUptime
+            host.layoutSubtreeIfNeeded()
+            RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.02))
+            host.layoutSubtreeIfNeeded()
+            let nativeText = descendants(host).compactMap { $0 as? ResponseTextView }
+            observedText = max(observedText, nativeText.count)
+            guard let observer = descendants(host).compactMap({ $0 as? TranscriptScrollObserverView }).first,
+                  let scroll = observer.enclosingScrollView, let document = scroll.documentView else {
+                fatalError("The real chat must attach its user-scroll observer to the transcript")
+            }
+            observerConnected = true
+            guard document.bounds.height > scroll.contentView.bounds.height else { fatalError("The fixture must actually scroll beyond the first reply") }
+            let completed = nativeText.filter { $0.string.hasPrefix("Agent Conductor") }
+            let passes = completed.map(\.layoutPasses)
+            NotificationCenter.default.post(name: NSScrollView.willStartLiveScrollNotification, object: scroll)
+            for position in 0..<20 {
+                scroll.contentView.scroll(to: NSPoint(x: 0, y: CGFloat(position) / 19 * max(0, document.bounds.height - scroll.contentView.bounds.height)))
+                scroll.reflectScrolledClipView(scroll.contentView)
+                NotificationCenter.default.post(name: NSScrollView.didLiveScrollNotification, object: scroll)
+                host.layoutSubtreeIfNeeded()
+            }
+            NotificationCenter.default.post(name: NSScrollView.didEndLiveScrollNotification, object: scroll)
+            RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.02))
+            host.layoutSubtreeIfNeeded()
+            guard completed.map(\.layoutPasses) == passes else { fatalError("Manual scrolling invalidated a completed reply's native layout") }
+            for text in nativeText {
+                guard let layout = text.layoutManager, let container = text.textContainer else { fatalError("Missing native reply layout") }
+                layout.ensureLayout(for: container)
+                let used = layout.usedRect(for: container)
+                guard used.maxY <= text.bounds.height + 1, used.maxX <= text.bounds.width + 1 else {
+                    fatalError("Full chat reply overflow at frame \(frame): drawn \(used), allocated \(text.bounds)")
+                }
+            }
+            maximum = max(maximum, ProcessInfo.processInfo.systemUptime - begin)
+        }
+        guard observerConnected && observedText >= 6 && maximum < 1 else { fatalError("Offscreen chat layout stalled or did not instantiate its replies") }
+        print(String(format: "Full chat offscreen scroll passed: waiting, streaming, handoff, %d native text views within card bounds, 240 scroll positions; maximum snapshot %.1f ms", observedText, maximum * 1000))
+    }
+    private func descendants(_ view: NSView) -> [NSView] { view.subviews.flatMap { [$0] + descendants($0) } }
     private func start() {
         lastPulse = ProcessInfo.processInfo.systemUptime
         pulse = Timer.scheduledTimer(timeInterval: 0.02, target: self, selector: #selector(measurePulse), userInfo: nil, repeats: true)

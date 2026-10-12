@@ -53,9 +53,12 @@ else:
     time.sleep(0.1)
 text = "Fixture response from " + name + " 🦀"
 if "codex" in name:
+    print(json.dumps({"type":"item.completed","item":{"id":"r1","type":"reasoning","text":"Fixture thinking for " + name}}), flush=True)
     print(json.dumps({"type":"item.completed","item":{"type":"agent_message","text":text}}), flush=True)
     print(json.dumps({"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":5}}), flush=True)
 else:
+    for _ in range(100): print(json.dumps({"type":"system","subtype":"thinking_tokens"}), flush=True)
+    print(json.dumps({"type":"assistant","message":{"content":[{"type":"thinking","thinking":"Fixture thinking for " + name}]}}), flush=True)
     print(json.dumps({"type":"result","result":text,"is_error":False,"session_id":"fixture-session"}), flush=True)
 '''
 providers = ["claude", "codex", "antigravity", "qoder", "deep_seek"]
@@ -105,6 +108,8 @@ try:
     send(dict(type="start", prompt=literal, settings=settings))
     run = until(lambda e: e["type"] == "run_updated" and e["run"]["status"] == "Completed")["run"]
     assert len(run["stages"]) == 2 and all(s["output"].startswith("Fixture response") for s in run["stages"])
+    assert all(s["reasoning"].startswith("Fixture thinking for ") for s in run["stages"])
+    assert all(sum(log["text"] == "Thinking…" for log in s["logs"]) == 1 for s in run["stages"])
     assert (AREA / "fixture-claude.prompt").read_text() == literal
     send(dict(type="get_run", run_id=run["id"]))
     assert until(lambda e: e["type"] == "run_detail")["run"]["prompt"] == literal
@@ -118,6 +123,8 @@ try:
     handoff = until(lambda e: e["type"] == "run_updated" and e["run"]["status"] == "Completed")["run"]
     assert handoff["workspace"] == str(SECOND)
     assert "Fixture response from fixture-claude" in (SECOND / "fixture-codex.prompt").read_text()
+    assert "Fixture thinking for " not in (SECOND / "fixture-codex.prompt").read_text()
+    assert all(s["reasoning"].startswith("Fixture thinking for ") for s in handoff["stages"])
     settings["workflow"] = "Independent"
     send(dict(type="start", prompt="slow fixture", settings=settings))
     slow = until(lambda e: e["type"] == "run_updated" and e["run"]["status"] == "Running")["run"]

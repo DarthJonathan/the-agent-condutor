@@ -2,37 +2,99 @@ import AppKit
 import Foundation
 import SwiftUI
 
-// Keep one main-queue delivery scheduled. If layout is busy, replace adjacent
-// streaming snapshots with their latest value; preserve every control transition.
+// Coalesce visual progress between frames and hold it during a live scroll.
+// Control transitions stay immediate; the engine keeps working independently.
 final class EventDelivery {
-    private typealias Snapshot = (EngineEvent, [Provider: [ResponseBlock]], [String: [ResponseBlock]])
+    private struct Status: Equatable { let id: String; let value: String }
+    private struct MessageControl: Equatable {
+        let id: String; let kind: String; let status: String
+        let question: String?; let answered: Bool
+        let approval: String?; let decision: Bool?
+    }
+    private struct ControlState: Equatable {
+        let status: String
+        let stages: [Status]
+        let messages: [MessageControl]
+        let mailbox: [Status]
+        init(_ run: RunRecord) {
+            status = run.status.rawValue
+            stages = run.stages.map { Status(id: $0.provider.rawValue, value: $0.status.rawValue) }
+            messages = (run.conversation?.messages ?? []).map {
+                MessageControl(id: $0.id, kind: $0.kind, status: $0.status.rawValue,
+                               question: $0.questionRequest?.id, answered: $0.questionRequest?.answers != nil,
+                               approval: $0.approvalRequest?.id, decision: $0.approvalRequest?.decision)
+            }
+            mailbox = (run.conversation?.mailbox ?? []).map { Status(id: $0.id, value: $0.state) }
+        }
+    }
+    private struct Snapshot {
+        let event: EngineEvent
+        let rendered: [Provider: [ResponseBlock]]
+        let chat: [String: [ResponseBlock]]
+        let control: ControlState?
+        var progress: Bool
+    }
     private let lock = NSLock()
     private var pending: [Snapshot] = []
+    private var controls: [String: ControlState] = [:]
     private var scheduled = false
+    private var delayed = false
+    private var generation = 0
+    private var scrolling = false
+    private var lastDelivery: TimeInterval = 0
     private let receive: @MainActor (EngineEvent, [Provider: [ResponseBlock]], [String: [ResponseBlock]]) -> Void
     init(receive: @escaping @MainActor (EngineEvent, [Provider: [ResponseBlock]], [String: [ResponseBlock]]) -> Void) {
         self.receive = receive
     }
     func enqueue(_ event: EngineEvent, rendered: [Provider: [ResponseBlock]], chat: [String: [ResponseBlock]]) {
         lock.lock()
-        let snapshot = (event, rendered, chat)
-        if event.type == "run_updated", event.run?.status == .running,
-           let last = pending.last, last.0.type == "run_updated", last.0.run?.status == .running, last.0.run?.id == event.run?.id {
-            pending[pending.count - 1] = snapshot
-        } else { pending.append(snapshot) }
-        if !scheduled {
-            scheduled = true
-            DispatchQueue.main.async { [self] in drain() }
+        defer { lock.unlock() }
+        let control = event.run.map(ControlState.init)
+        let progress = event.type == "run_updated" && event.run?.status == .running && event.run.map { controls[$0.id] == control } == true
+        if let run = event.run, let control {
+            controls[run.id] = control
+            if controls.count > 128, let evicted = controls.keys.first(where: { $0 != run.id }) { controls.removeValue(forKey: evicted) }
         }
-        lock.unlock()
+        var snapshot = Snapshot(event: event, rendered: rendered, chat: chat, control: control, progress: progress)
+        if event.type == "run_updated", event.run?.status == .running,
+           let last = pending.last, last.event.type == "run_updated", last.event.run?.status == .running,
+           last.event.run?.id == event.run?.id, last.control == control {
+            // A newer token snapshot can carry the same initial/control state.
+            snapshot.progress = last.progress && snapshot.progress
+            pending[pending.count - 1] = snapshot
+        } else if progress, let index = pending.indices.reversed().prefix(while: { pending[$0].progress }).first(where: { pending[$0].event.run?.id == event.run?.id }) {
+            pending[index] = snapshot
+        } else { pending.append(snapshot) }
+        if pending.contains(where: { !$0.progress }) {
+            if !scheduled || delayed { scheduleLocked(after: 0) }
+        } else if !scheduled && !scrolling {
+            scheduleLocked(after: max(0, 1.0 / 15 - (ProcessInfo.processInfo.systemUptime - lastDelivery)))
+        }
     }
-    @MainActor private func drain() {
+    func setScrolling(_ active: Bool) {
         lock.lock()
+        defer { lock.unlock() }
+        guard scrolling != active else { return }
+        scrolling = active
+        if active && pending.allSatisfy(\.progress) {
+            generation += 1; scheduled = false; delayed = false
+        } else if !active && !pending.isEmpty { scheduleLocked(after: 0) }
+    }
+    private func scheduleLocked(after delay: TimeInterval) {
+        scheduled = true; delayed = delay > 0; generation += 1
+        let current = generation
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [self] in drain(current) }
+    }
+    @MainActor private func drain(_ current: Int) {
+        lock.lock()
+        guard generation == current else { lock.unlock(); return }
+        scheduled = false; delayed = false
+        guard !scrolling || pending.contains(where: { !$0.progress }) else { lock.unlock(); return }
         let snapshots = pending
         pending.removeAll(keepingCapacity: true)
-        scheduled = false
+        lastDelivery = ProcessInfo.processInfo.systemUptime
         lock.unlock()
-        for (event, rendered, chat) in snapshots { receive(event, rendered, chat) }
+        for snapshot in snapshots { receive(snapshot.event, snapshot.rendered, snapshot.chat) }
     }
 }
 
@@ -261,6 +323,7 @@ final class EngineStore: ObservableObject {
     private var input: FileHandle?
     private var output: FileHandle?
     private var reader: EventReader?
+    private var delivery: EventDelivery?
     private let writer = DispatchQueue(label: "dev.agentconductor.commands")
     private var applying = false
     private var saving: Task<Void, Never>?
@@ -285,6 +348,8 @@ final class EngineStore: ObservableObject {
         screen = options.view
         newAgentNames = AgentIdentity.suggestedTeam(members: Provider.allCases)
     }
+
+    func setTranscriptScrolling(_ active: Bool) { delivery?.setScrolling(active) }
 
     var busy: Bool { runs.contains { $0.status.active } }
     var workspaceRuns: [RunSummary] { runs.filter { $0.workspace == settings.workspace } }
@@ -468,6 +533,7 @@ final class EngineStore: ObservableObject {
         input = incoming.fileHandleForWriting
         output = outgoing.fileHandleForReading
         let delivery = EventDelivery { [weak self] event, rendered, chat in self?.apply(event, rendered: rendered, chat: chat) }
+        self.delivery = delivery
         reader = EventReader(receive: { event, rendered, chat in
             delivery.enqueue(event, rendered: rendered, chat: chat)
         }, fail: { [weak self] message in
@@ -540,7 +606,10 @@ final class EngineStore: ObservableObject {
         case "run_updated", "run_detail":
             guard let run = event.run else { return }
             for message in run.conversation?.messages ?? [] {
-                if let request = message.questionRequest, request.answers != nil, pendingQuestionReplies.contains(request.id) { pendingQuestionReplies.remove(request.id) }
+                if let request = message.questionRequest, pendingQuestionReplies.contains(request.id),
+                   request.answers != nil || run.conversation?.mailbox?.contains(where: { $0.questionTarget?.requestId == request.id }) == true || !run.status.active {
+                    pendingQuestionReplies.remove(request.id)
+                }
                 if let request = message.approvalRequest, request.decision != nil, pendingQuestionReplies.contains(request.id) { pendingQuestionReplies.remove(request.id) }
             }
             if pendingChat && event.type == "run_updated" && run.status.active && run.conversation?.messages.last(where: { $0.kind == "user" })?.text == submittedChatPrompt {
@@ -766,6 +835,33 @@ final class EngineStore: ObservableObject {
         loaded && connected && !demo && !busy && !pendingChat && pendingQuestionReplies.isEmpty
         && selectedRun?.id == runID && message.questionRequest?.answers == nil && message.questionRequest != nil
         && message.author.map { availability($0)?.ready == true && effortIsValid($0) } == true
+        && questionDelegate(runID: runID, message: message) == nil
+    }
+    func questionDelegate(runID: String, message: ChatMessage) -> MailboxDelivery? {
+        guard selectedRun?.id == runID, let request = message.questionRequest, request.answers == nil else { return nil }
+        return selectedRun?.conversation?.mailbox?.last { $0.pendingQuestionAnswer && $0.questionTarget?.messageId == message.id && $0.questionTarget?.requestId == request.id }
+    }
+    func questionTeammates(runID: String, message: ChatMessage) -> [Coworker] {
+        guard canAnswerQuestion(runID: runID, message: message), let chat = selectedRun?.conversation,
+              let owner = message.authorId,
+              chat.mailbox?.contains(where: { $0.to == owner && $0.responseId == message.id && $0.state == "waiting_for_user" }) == true else { return [] }
+        return (chat.coworkers ?? []).filter { worker in
+            worker.id != owner && availability(worker.provider)?.ready == true
+                && (worker.effort == .default || effortOptions(worker.provider, model: worker.model.isEmpty ? defaultModel(worker.provider) : worker.model).contains(worker.effort))
+                && !chat.pendingQuestions.contains(where: { $0.authorId == worker.id })
+                && !chat.pendingApprovals.contains(where: { $0.authorId == worker.id })
+        }
+    }
+    func delegateQuestion(runID: String, message: ChatMessage, coworkerID: String) -> String? {
+        guard let request = message.questionRequest, questionTeammates(runID: runID, message: message).contains(where: { $0.id == coworkerID }) else {
+            return "Choose an available teammate in this chat after the current exchange finishes."
+        }
+        saving?.cancel()
+        pendingQuestionReplies.insert(request.id)
+        send(["type": "session_key", "key": sessionKey, "claude_key": claudeSessionKey, "kiro_key": kiroSessionKey])
+        send(["type": "delegate_question", "run_id": runID, "message_id": message.id, "request_id": request.id,
+              "coworker_id": coworkerID, "settings": encodedSettings()])
+        return nil
     }
     func answerQuestion(runID: String, message: ChatMessage, answers: [AgentQuestionAnswer]) -> String? {
         guard canAnswerQuestion(runID: runID, message: message), let request = message.questionRequest else {

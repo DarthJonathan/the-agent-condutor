@@ -1663,6 +1663,16 @@ fn render_run(
                 ui.set_min_height(110.0);
                 match tab {
                     DetailTab::Response => {
+                        if !stage.reasoning.is_empty() {
+                            egui::CollapsingHeader::new(if stage.provider == Provider::Codex {
+                                "Reasoning summary"
+                            } else {
+                                "Thinking"
+                            })
+                            .id_salt((run.id, stage.provider, "reasoning"))
+                            .show(ui, |ui| render_markdown(ui, &stage.reasoning));
+                            ui.add_space(8.0);
+                        }
                         if let Some(error) = &stage.error {
                             Frame::new()
                                 .fill(Color32::from_rgb(47, 28, 35))

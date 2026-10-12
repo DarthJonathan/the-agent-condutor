@@ -33,6 +33,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NSM
     func applicationDidFinishLaunching(_ notification: Notification) {
         let width: CGFloat = options.compact ? 1050 : 1320
         let height: CGFloat = options.compact ? 740 : 900
+        // Let AppKit handle title-bar double-clicks, including the system's
+        // Fill/Zoom preference and restoration to the previous window size.
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: width, height: height),
                               styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView], backing: .buffered, defer: false)
         window.title = "Agent Conductor"
@@ -41,6 +43,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NSM
         window.backgroundColor = NSColor(Theme.background)
         window.minSize = NSSize(width: 1050, height: 740)
         window.isReleasedWhenClosed = false
+        window.collectionBehavior.insert(.fullScreenPrimary)
         let root = RootView().environmentObject(store).environment(\.colorScheme, .dark).tint(Theme.accent)
         window.contentView = NSHostingView(rootView: root)
         let toolbar = NSToolbar(identifier: "conductor-toolbar")
@@ -103,6 +106,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NSM
         let windowMenu = NSMenu(title: "Window")
         windowMenu.addItem(withTitle: "Minimize", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
         windowMenu.addItem(withTitle: "Zoom", action: #selector(NSWindow.performZoom(_:)), keyEquivalent: "")
+        let fullScreen = windowMenu.addItem(withTitle: "Enter Full Screen", action: #selector(NSWindow.toggleFullScreen(_:)), keyEquivalent: "f")
+        fullScreen.keyEquivalentModifierMask = [.control, .command]
         windows.submenu = windowMenu
         bar.addItem(windows)
         NSApp.windowsMenu = windowMenu

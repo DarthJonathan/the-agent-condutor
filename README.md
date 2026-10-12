@@ -15,6 +15,8 @@ Use `bash scripts/bundle-macos.sh --debug` for a faster development build. The b
 
 The build generates a full macOS icon set from `macos/Assets/AppIcon.png` and embeds it in the bundle. The original image generation prompt is saved beside the artwork. Install the finished app with `ditto "dist/Agent Conductor.app" "/Applications/Agent Conductor.app"`, then open it from Applications.
 
+Title-bar double-clicks follow the native macOS **Fill/Zoom** behavior configured in **System Settings → Desktop & Dock**. The **Fill** action expands the window within the available desktop. The green window button and **Control+Command+F** enter or leave full screen; title bar buttons and workspace controls retain their normal click actions.
+
 Preview sample runs without invoking providers or writing settings/history:
 
 ```sh
@@ -111,6 +113,12 @@ Every headless provider receives the same question protocol. A live question use
 
 Options may be omitted for free text; up to eight choices per question are supported. Agents end their turn after asking, and Conductor resumes their exact saved session with the human's answers. This works with the current one-shot headless CLIs and direct DeepSeek API mode. Claude-style `AskUserQuestion` events that remain unanswered after a completed turn are converted into the same cards. Native interactive SDK tool-response channels are not wired: [Claude's headless modes can deny interactive questions](https://code.claude.com/docs/en/headless#auto-approve-tools), whereas its [Agent SDK uses a callback for question replies](https://code.claude.com/docs/en/agent-sdk/user-input#handle-clarifying-questions). Clarification answers never change file or tool permissions.
 
+## Responses and thinking
+
+Responses keep the answer separate from provider-supplied **Thinking**, or **Reasoning summary** for Codex. The collapsed section previews the latest text; expand it to read the retained content in a bounded scroll area. Reasoning is saved with its own message or stage, capped at 64 KiB per invocation, and is not added to shared coworker context or the final answer.
+
+The decoder accepts Claude/Qoder thinking blocks and deltas, Codex JSONL reasoning items, DeepSeek `reasoning_content`, and Kiro ACP thought chunks. It displays only readable text returned by the provider, never signatures or encrypted/redacted blocks. Some configurations expose only token counts; those produce one **Thinking…** activity entry. Old saved `System: thinking_tokens` spam is also coalesced when displayed. Text discarded by earlier builds cannot be recovered from those counters. Provider formats: [Claude streaming](https://platform.claude.com/docs/en/build-with-claude/streaming), [Codex noninteractive JSONL](https://learn.chatgpt.com/docs/non-interactive-mode#make-output-machine-readable), [DeepSeek thinking mode](https://api-docs.deepseek.com/guides/thinking_mode/), [Kiro ACP updates](https://kiro.dev/docs/cli/v3/acp-migration/).
+
 ## Attention, changes and isolation
 
 The coworker list shows **Working**, **Waiting for [coworker]**, **Needs your answer**, **Ready for review**, and queued/stopped/error states. The sidebar **Inbox** collects unanswered questions, command approvals and changes awaiting review across saved chats. Opening an item selects its owning chat and jumps to the question/approval or opens Changes.
@@ -197,9 +205,9 @@ SwiftUI `--capture` produces a layout preview using ImageRenderer. AppKit-backed
 Check folder selection, draft restoration, task scoping, provider switching, and credential isolation without starting an app window:
 
 ```sh
-xcrun swiftc -swift-version 5 -warnings-as-errors -target "$(uname -m)-apple-macosx14.0" -module-cache-path target/swift-module-cache macos/Models.swift macos/MentionEditor.swift macos/EngineStore.swift macos/Views.swift scripts/workspace-smoke.swift -o target/workspace-smoke-test
+xcrun swiftc -swift-version 5 -warnings-as-errors -target "$(uname -m)-apple-macosx14.0" -module-cache-path target/swift-module-cache macos/Models.swift macos/NativeResponseText.swift macos/MentionEditor.swift macos/EngineStore.swift macos/Views.swift scripts/workspace-smoke.swift -o target/workspace-smoke-test
 target/workspace-smoke-test
-xcrun swiftc -swift-version 5 -warnings-as-errors -target "$(uname -m)-apple-macosx14.0" -module-cache-path target/swift-module-cache macos/Models.swift macos/MentionEditor.swift macos/EngineStore.swift macos/Views.swift scripts/team-store-smoke.swift -o target/team-store-smoke-test
+xcrun swiftc -swift-version 5 -warnings-as-errors -target "$(uname -m)-apple-macosx14.0" -module-cache-path target/swift-module-cache macos/Models.swift macos/NativeResponseText.swift macos/MentionEditor.swift macos/EngineStore.swift macos/Views.swift scripts/team-store-smoke.swift -o target/team-store-smoke-test
 target/team-store-smoke-test
 ```
 
@@ -208,18 +216,49 @@ For populated Inbox, question, approval, team and Changes layout previews, run `
 Check UI event delivery under backpressure and response layouts:
 
 ```sh
-xcrun swiftc -swift-version 5 -warnings-as-errors -target "$(uname -m)-apple-macosx14.0" -module-cache-path target/swift-module-cache macos/Models.swift macos/MentionEditor.swift macos/EngineStore.swift macos/Views.swift scripts/responsiveness-smoke.swift -o target/responsiveness-smoke-test
+xcrun swiftc -swift-version 5 -warnings-as-errors -target "$(uname -m)-apple-macosx14.0" -module-cache-path target/swift-module-cache macos/Models.swift macos/NativeResponseText.swift macos/MentionEditor.swift macos/EngineStore.swift macos/Views.swift scripts/responsiveness-smoke.swift -o target/responsiveness-smoke-test
 target/responsiveness-smoke-test --delivery-only
 target/responsiveness-smoke-test --render-only
+target/responsiveness-smoke-test --offscreen-scroll
 target/responsiveness-smoke-test
 ```
 
-The delivery check queues 1,000 streaming snapshots before the main loop can consume them, verifying that only the latest adjacent running snapshot is delivered and that start, question, notice and completion events retain their order. Chat columns have concrete widths, unchanged Markdown blocks are retained, and unchanged metadata does not publish additional updates. The native window fixture measures main-loop delays during waiting, streamed responses, mention completion and inspector switching; it uses synthetic data and never launches an engine or provider. Native window mode requires access to the desktop, while the two other modes work without opening a window. ImageRenderer omits AppKit controls and is a layout check, not a substitute for native responsiveness measurements.
+The delivery check queues 1,000 streaming snapshots before the main loop can consume them, preserving start, question, notice and completion events. Visual progress is coalesced per run and paced to 15 updates per second. During a live user scroll, progress waits until the gesture ends, then the latest text is delivered; the engine continues running. Questions, approvals, handoffs and terminal states bypass that hold. Checks cover all of these transitions, interleaved runs and cancellation without restoring stale progress.
+
+Chat columns have concrete widths. Completed cards receive only their own content and display names, retain unchanged Markdown, and do not observe the streaming store. Question and approval controls observe it independently. Replies, errors, reasoning and activity use native selectable TextKit views, with cached text layout per response width. Streaming replies reuse unchanged formatted blocks and replace only the changed text suffix, preserving selection and existing table objects. Native text tables replace the SwiftUI Grid and its height preference loop. The transcript keeps stable card heights in an eager stack, avoiding paragraph selection overlays and lazy height estimation. Repeated follow requests coalesce and wait for layout; user scrolling pauses following until the reader returns to the bottom or chooses Latest.
+
+The native window fixture measures main-loop delays during waiting, long streamed responses, teammate handoffs, mention completion and inspector switching; it uses synthetic data and never launches an engine or provider. Native window mode requires access to the desktop. `--offscreen-scroll` uses a hidden, never-ordered window to give the real chat's AppKit scroll document valid bounds. It moves the viewport through the transcript while simulating teammate updates and checking every reply's drawn bounds. ImageRenderer omits AppKit controls and is a layout check, not a substitute for native responsiveness measurements.
+
+Exercise actual native text layout and an offscreen SwiftUI/AppKit scroll hierarchy, including large replies, selection, table geometry and cached measurements:
+
+```sh
+xcrun swiftc -swift-version 5 -warnings-as-errors -target "$(uname -m)-apple-macosx14.0" -module-cache-path target/swift-module-cache -O macos/Models.swift macos/NativeResponseText.swift scripts/native-text-smoke.swift -o target/native-text-smoke-test
+target/native-text-smoke-test
+target/native-text-smoke-test --draw-scroll
+```
+
+This check scrolls four 28 KB replies through 600 native and 300 hosted viewport positions in a hidden window, then updates the teammate reply. It verifies that the viewport moves beyond the first reply, completed replies retain their measured layouts, user scrolling takes priority over following, and native tables occupy distinct columns. Streaming and window-resizing checks compare drawn text bounds with each card's allocated height, including code blocks, tables and wrapped formulas. Height measurement uses an independent TextKit container so the native view's previous frame cannot affect the next card size. It writes `target/native-markdown-preview.png` and `target/native-reply-bounds-preview.png`. `--draw-scroll` additionally renders 60 viewport positions at Retina scale and reports drawing timings. These offscreen checks do not measure live trackpad interaction or compositor performance.
+
+Benchmark native streaming updates and check that incremental formatting matches a freshly formatted document, including earlier rewrites, long code, Unicode, shrinking replies and style changes:
+
+```sh
+xcrun swiftc -swift-version 5 -warnings-as-errors -target "$(uname -m)-apple-macosx14.0" -module-cache-path target/swift-module-cache -O macos/Models.swift macos/NativeResponseText.swift scripts/streaming-text-smoke.swift -o target/streaming-text-smoke-test
+target/streaming-text-smoke-test
+```
+
+Check backward compatibility, reasoning display data, saved heartbeat cleanup, and completed-card stability during 1,000 teammate updates:
+
+```sh
+xcrun swiftc -swift-version 5 -warnings-as-errors -target "$(uname -m)-apple-macosx14.0" -module-cache-path target/swift-module-cache macos/Models.swift macos/NativeResponseText.swift macos/MentionEditor.swift macos/EngineStore.swift macos/Views.swift scripts/response-smoke.swift -o target/response-smoke-test
+target/response-smoke-test
+```
+
+Rust decoder tests cover partial/final reasoning deduplication, public summaries, session scoping, token-only heartbeats, and UTF-8 limits. Bridge and team fixtures verify persistence, separate answer text, and handoffs that exclude reasoning from coworker prompts.
 
 Check Markdown parsing and render a layout fixture with tables, lists, quotes, and code:
 
 ```sh
-xcrun swiftc -swift-version 5 -warnings-as-errors -module-cache-path target/swift-module-cache macos/Models.swift macos/MentionEditor.swift macos/EngineStore.swift macos/Views.swift scripts/markdown-smoke.swift -o target/markdown-smoke
+xcrun swiftc -swift-version 5 -warnings-as-errors -module-cache-path target/swift-module-cache macos/Models.swift macos/NativeResponseText.swift macos/MentionEditor.swift macos/EngineStore.swift macos/Views.swift scripts/markdown-smoke.swift -o target/markdown-smoke
 target/markdown-smoke --render
 ```
 
@@ -257,6 +296,7 @@ The SwiftUI app targets macOS. Linux and Windows builds of the Rust fallback rem
 | `macos/MentionEditor.swift` | Native message input and teammate @ autocomplete |
 | `macos/EngineStore.swift` | Background event decoding, UI state and Rust process lifecycle |
 | `macos/Models.swift` | Shared JSON models and response formatting |
+| `macos/NativeResponseText.swift` | Cached native Markdown text layout, selectable tables, and transcript scroll tracking |
 | `src/bridge.rs` | Headless engine controller, JSON protocol and batched run updates |
 | `src/conversation.rs` | Persistent Chat routing, shared context, teammate delivery and per-agent resumption |
 | `src/team.rs` | Stable coworker IDs, roles, correlated mailbox scheduling, independent sessions and human decisions |

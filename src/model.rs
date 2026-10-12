@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use uuid::Uuid;
 
 pub const MAX_OUTPUT_BYTES: usize = 256 * 1024;
+pub const MAX_REASONING_BYTES: usize = 64 * 1024;
 pub const MAX_LOGS: usize = 1500;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -344,6 +345,8 @@ pub struct Stage {
     pub status: Status,
     pub session_id: Option<String>,
     pub output: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reasoning: String,
     pub logs: Vec<LogEntry>,
     pub usage: Usage,
     pub error: Option<String>,
@@ -467,6 +470,8 @@ pub struct ChatMessage {
     pub to: Vec<Provider>,
     pub text: String,
     pub status: Status,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reasoning: String,
     pub model: String,
     #[serde(default)]
     pub effort: Effort,
@@ -496,6 +501,7 @@ impl ChatMessage {
             to,
             text,
             status: Status::Completed,
+            reasoning: String::new(),
             model: String::new(),
             effort: Effort::Default,
             session_id: None,
@@ -714,6 +720,7 @@ impl Run {
                     status: Status::Queued,
                     session_id: None,
                     output: String::new(),
+                    reasoning: String::new(),
                     logs: vec![],
                     usage: Usage::default(),
                     error: None,
@@ -1053,11 +1060,39 @@ mod tests {
         run.status = Status::Running;
         run.stages[0].status = Status::Completed;
         run.stages[0].output = "keep me".into();
+        run.stages[0].reasoning = "Provider summary".into();
         run.recover();
         assert_eq!(run.status, Status::Interrupted);
         assert_eq!(run.stages[0].status, Status::Completed);
         assert_eq!(run.stages[0].output, "keep me");
+        assert_eq!(run.stages[0].reasoning, "Provider summary");
         assert_eq!(run.stages[1].status, Status::Interrupted);
+    }
+
+    #[test]
+    fn reasoning_persists_and_legacy_messages_default_to_empty() {
+        let run = Run::new(&Settings::default(), "task".into());
+        let legacy = serde_json::to_value(&run).unwrap();
+        assert!(legacy["stages"][0].get("reasoning").is_none());
+        assert!(
+            serde_json::from_value::<Run>(legacy).unwrap().stages[0]
+                .reasoning
+                .is_empty()
+        );
+        let mut message =
+            ChatMessage::new("assistant", Some(Provider::Claude), vec![], "Answer".into());
+        let legacy = serde_json::to_value(&message).unwrap();
+        assert!(
+            serde_json::from_value::<ChatMessage>(legacy)
+                .unwrap()
+                .reasoning
+                .is_empty()
+        );
+        message.reasoning = "Provider text".into();
+        let restored: ChatMessage =
+            serde_json::from_value(serde_json::to_value(&message).unwrap()).unwrap();
+        assert_eq!(restored.text, "Answer");
+        assert_eq!(restored.reasoning, "Provider text");
     }
 
     #[test]

@@ -230,16 +230,28 @@ enum RunStatus: String, Codable {
     }
 }
 
-struct Usage: Decodable {
+struct Usage: Decodable, Equatable {
     let inputTokens: UInt64
     let outputTokens: UInt64
     let costUsd: Double?
 }
 
-struct LogEntry: Decodable {
+struct LogEntry: Decodable, Equatable {
     let at: String
     let kind: String
     let text: String
+}
+
+func visibleActivityLogs(_ logs: [LogEntry]) -> [LogEntry] {
+    var thinkingShown = false
+    return logs.compactMap { log in
+        if ["System: thinking_tokens", "Agent is reasoning", "Thinking…"].contains(log.text) {
+            guard !thinkingShown else { return nil }
+            thinkingShown = true
+            return LogEntry(at: log.at, kind: log.kind, text: "Thinking…")
+        }
+        return log
+    }
 }
 
 struct Stage: Decodable, Identifiable {
@@ -251,6 +263,7 @@ struct Stage: Decodable, Identifiable {
     let logs: [LogEntry]
     let usage: Usage
     let error: String?
+    var reasoning: String? = nil
     var id: Provider { provider }
 }
 
@@ -384,6 +397,8 @@ struct MailboxDelivery: Decodable, Identifiable {
     let state: String
     let replyTo: String?
     let responseId: String?
+    var questionTarget: QuestionTarget? = nil
+    var pendingQuestionAnswer: Bool { kind == "question_answer" && ["queued", "delivered", "paused", "waiting_for_user"].contains(state) }
     var cancellable: Bool { ["queued", "delivered", "paused"].contains(state) }
     var label: String {
         switch state {
@@ -399,6 +414,11 @@ struct MailboxDelivery: Decodable, Identifiable {
     }
 }
 
+struct QuestionTarget: Decodable, Equatable {
+    let messageId: String
+    let requestId: String
+}
+
 struct AttentionItem: Decodable, Identifiable, Equatable {
     let id: String
     let messageId: String?
@@ -407,7 +427,7 @@ struct AttentionItem: Decodable, Identifiable, Equatable {
     let title: String
 }
 
-struct AgentApprovalRequest: Decodable, Identifiable {
+struct AgentApprovalRequest: Decodable, Identifiable, Equatable {
     let id: String
     let summary: String
     let argv: [String]
@@ -433,7 +453,7 @@ struct ChangedFile: Decodable, Identifiable {
     var id: String { path }
 }
 
-struct CheckResult: Decodable, Identifiable {
+struct CheckResult: Decodable, Identifiable, Equatable {
     let id: String
     let at: String
     let ownerId: String?
@@ -646,7 +666,7 @@ struct AgentSession: Decodable {
     var coworkerId: String? = nil
 }
 
-struct ChatMessage: Decodable, Identifiable {
+struct ChatMessage: Decodable, Identifiable, Equatable {
     let id: String
     let at: String
     let kind: String
@@ -665,16 +685,17 @@ struct ChatMessage: Decodable, Identifiable {
     var authorId: String? = nil
     var recipientIds: [String]? = nil
     var approvalRequest: AgentApprovalRequest? = nil
+    var reasoning: String? = nil
     var authorLabel: String { author?.name ?? (kind == "system" ? "Conductor" : "You") }
 }
 
-struct AgentQuestionOption: Decodable, Identifiable {
+struct AgentQuestionOption: Decodable, Identifiable, Equatable {
     let id: String
     let label: String
     let description: String
 }
 
-struct AgentUserQuestion: Decodable, Identifiable {
+struct AgentUserQuestion: Decodable, Identifiable, Equatable {
     let id: String
     let header: String
     let question: String
@@ -682,7 +703,7 @@ struct AgentUserQuestion: Decodable, Identifiable {
     let multiSelect: Bool
 }
 
-struct AgentQuestionAnswer: Codable {
+struct AgentQuestionAnswer: Codable, Equatable {
     let questionId: String
     let optionIds: [String]
     let text: String
@@ -690,10 +711,11 @@ struct AgentQuestionAnswer: Codable {
     var command: [String: Any] { ["question_id": questionId, "option_ids": optionIds, "text": text, "skipped": skipped] }
 }
 
-struct AgentQuestionRequest: Decodable, Identifiable {
+struct AgentQuestionRequest: Decodable, Identifiable, Equatable {
     let id: String
     let questions: [AgentUserQuestion]
     let answers: [AgentQuestionAnswer]?
+    var answeredBy: String? = nil
     var plainText: String {
         questions.map { question in
             var lines = [question.question] + question.options.map { "• \($0.label)\($0.description.isEmpty ? "" : ": \($0.description)")" }

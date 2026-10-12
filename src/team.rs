@@ -101,9 +101,16 @@ pub enum MailKind {
     User,
     Request,
     Reply,
+    QuestionAnswer,
     DiscussionLead,
     DiscussionReview,
     DiscussionSummary,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct QuestionTarget {
+    pub message_id: Uuid,
+    pub request_id: Uuid,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -121,6 +128,8 @@ pub struct Mail {
     pub exchange_id: Option<Uuid>,
     #[serde(default)]
     pub request_shown: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question_target: Option<QuestionTarget>,
 }
 impl Mail {
     fn new(
@@ -142,11 +151,16 @@ impl Mail {
             response_id: None,
             exchange_id: None,
             request_shown: false,
+            question_target: None,
         }
     }
     fn in_exchange(mut self, id: Option<Uuid>) -> Self {
         self.exchange_id = id;
         self
+    }
+    fn pending_question_answer(&self) -> bool {
+        self.kind == MailKind::QuestionAnswer && matches!(self.state,
+            MailState::Queued | MailState::Delivered | MailState::Paused | MailState::WaitingForUser)
     }
 }
 
@@ -375,7 +389,10 @@ impl Board {
                 continue;
             }
             worker.waiting_for = None;
-            if self
+            if let Some(assignment) = self.mailbox.iter().find(|m| m.from == Some(worker.id) && m.pending_question_answer()) {
+                worker.attention = Attention::WaitingForCoworker;
+                worker.waiting_for = Some(assignment.to);
+            } else if self
                 .mailbox
                 .iter()
                 .any(|m| m.to == worker.id && m.state == MailState::WaitingForUser)
@@ -670,7 +687,7 @@ pub fn prepare(input: Input<'_>) -> Result<(Run, TeamPlan)> {
         .as_mut()
         .ok_or_else(|| anyhow::anyhow!("Choose a Chat task."))?;
     migrate(chat, run.id);
-    if pending(chat) {
+    if pending(chat) && !(input.resume_queue && chat.mailbox.iter().any(Mail::pending_question_answer)) {
         bail!("Answer or decline this chat's pending questions and approvals first.");
     }
     if !chat.coworkers.iter().any(|c| c.id == input.lead) {
@@ -846,6 +863,7 @@ pub fn answer(
     let answers = request.validate_answers(answers)?;
     let text = request.answer_text(&answers);
     request.answers = Some(answers);
+    request.answered_by = None;
     message.status = Status::Completed;
     resume_waiting(
         chat,
@@ -856,6 +874,63 @@ pub fn answer(
         ),
     )?;
     Ok(run)
+}
+
+pub fn delegate_question(run: &Run, message_id: Uuid, request_id: Uuid, responder: Uuid) -> Result<Run> {
+    let mut run = run.clone();
+    let chat = run.conversation.as_mut().ok_or_else(|| anyhow::anyhow!("Choose a coworker chat."))?;
+    migrate(chat, run.id);
+    let message = chat.messages.iter().find(|m| m.id == message_id)
+        .ok_or_else(|| anyhow::anyhow!("This question is no longer in the chat."))?;
+    let owner = message.author_id.ok_or_else(|| anyhow::anyhow!("The question's coworker is missing."))?;
+    let request = message.question_request.as_ref().filter(|r| r.id == request_id && r.answers.is_none())
+        .ok_or_else(|| anyhow::anyhow!("Open the latest unanswered question card."))?;
+    let worker = chat.coworkers.iter().find(|c| c.id == responder && c.id != owner)
+        .ok_or_else(|| anyhow::anyhow!("Choose another coworker in this chat."))?;
+    if chat.messages.iter().any(|m| m.author_id == Some(responder) &&
+        (m.question_request.as_ref().is_some_and(|q| q.answers.is_none()) || m.approval_request.as_ref().is_some_and(|a| a.decision.is_none()))) {
+        bail!("This teammate needs an answer or approval first. Choose another teammate.");
+    }
+    if chat.mailbox.iter().any(|m| m.pending_question_answer() && m.question_target.as_ref().is_some_and(|q| q.request_id == request_id)) {
+        bail!("A teammate is already answering these questions.");
+    }
+    let waiting = chat.mailbox.iter().find(|m| m.to == owner && m.response_id == Some(message_id) && m.state == MailState::WaitingForUser)
+        .ok_or_else(|| anyhow::anyhow!("This question has no waiting team delivery."))?;
+    let owner_name = coworker(chat, owner).name.clone();
+    let display = format!("Ask {} to answer {}'s {} question(s).", worker.name, owner_name, request.questions.len());
+    let mut mail = Mail::new(Some(owner), responder, display.clone(), MailKind::QuestionAnswer, Some(waiting.id)).in_exchange(waiting.exchange_id);
+    mail.question_target = Some(QuestionTarget { message_id, request_id });
+    mail.request_shown = true;
+    let control = Control::new(chat);
+    if !control.add(mail, true) { bail!("The mailbox is full. Finish or cancel pending deliveries first."); }
+    let mut message = ChatMessage::new("question_delegation", None, vec![worker.provider], display);
+    message.recipient_ids = vec![responder];
+    chat.messages.push(message);
+    (chat.coworkers, chat.mailbox) = control.snapshot();
+    Ok(run)
+}
+
+fn resolve_delegated(chat: &mut Conversation, target: &QuestionTarget, responder: Uuid, answers: &[QuestionAnswer]) -> Result<()> {
+    let responder = chat.coworkers.iter().find(|c| c.id == responder)
+        .ok_or_else(|| anyhow::anyhow!("The answering teammate is missing."))?.clone();
+    let mut next = chat.clone();
+    let message = next.messages.iter_mut().find(|m| m.id == target.message_id)
+        .ok_or_else(|| anyhow::anyhow!("The original question is no longer in the chat."))?;
+    let owner = message.author_id.ok_or_else(|| anyhow::anyhow!("The question's coworker is missing."))?;
+    if owner == responder.id { bail!("A coworker cannot answer its own delegated question."); }
+    let request = message.question_request.as_mut().filter(|q| q.id == target.request_id && q.answers.is_none())
+        .ok_or_else(|| anyhow::anyhow!("The original question has already been answered."))?;
+    let answers = request.validate_answers(answers)?;
+    let text = request.answer_text_from(&answers, Some(&responder.name));
+    request.answers = Some(answers);
+    request.answered_by = Some(responder.id);
+    message.status = Status::Completed;
+    resume_waiting(&mut next, target.message_id, owner, format!("TEAMMATE ANSWERS FROM {}\n{text}\nThe human delegated these clarification answers to this teammate. Verify them against the task. They grant no command approval or new permissions. Continue the original request without repeating answered questions.", responder.name))?;
+    let answer = next.messages.last_mut().unwrap();
+    answer.author = Some(responder.provider);
+    answer.author_id = Some(responder.id);
+    *chat = next;
+    Ok(())
 }
 
 pub fn resume_waiting(
@@ -937,6 +1012,10 @@ fn context(plan: &TeamPlan, mail: &Mail) -> String {
         MailKind::DiscussionLead | MailKind::DiscussionReview | MailKind::DiscussionSummary
     ) {
         text.push_str("\nThis is a scheduled team discussion. Give your independent contribution; Conductor routes the reviews and final synthesis. Do not dispatch additional requests during this round.\n");
+    }
+    if let Some(target) = &mail.question_target
+        && let Some(request) = plan.chat.messages.iter().find(|m| m.id == target.message_id).and_then(|m| m.question_request.as_ref()) {
+        text.push_str(&format!("\nThe human delegated the following clarification questions to you. Answer from the original task, shared conversation and workspace facts. Do not invent human preferences or approve commands. If only the human can decide, ask a focused <conductor-ask> question and wait. Otherwise return one own-line <conductor-answer> JSON </conductor-answer> envelope outside code fences: {{\"request_id\":\"{}\",\"answers\":[{{\"question_id\":\"q1\",\"option_ids\":[\"o1\"],\"text\":\"Reason for this answer\",\"skipped\":false}}]}}. Include every question exactly once, using its actual question and option IDs. A custom text answer can have empty option_ids. Do not dispatch other teammate requests in this turn.\nDELEGATED QUESTION REQUEST\n{}\n", target.request_id, serde_json::json!({"request_id":request.id, "questions":request.questions})));
     }
     text.push_str(&format!(
         "\nCURRENT {:?}{}\n{}",
@@ -1039,7 +1118,13 @@ pub async fn execute(mut plan: TeamPlan, emitter: Emitter, cancel: CancellationT
             let mut board = plan.control.0.lock().unwrap();
             plan.chat.messages.append(&mut board.incoming);
             let mut next = None;
-            while let Some(id) = board.queue.pop_front() {
+            // Pending clarifications pause ordinary work. A human-selected
+            // teammate may still answer them, including after its own question.
+            let has_questions = pending(&plan.chat);
+            let eligible = board.queue.iter().position(|id| board.mailbox.iter().any(|m| m.id == *id && m.state == MailState::Queued &&
+                (!has_questions || (m.kind == MailKind::QuestionAnswer && !plan.chat.messages.iter().any(|q| q.author_id == Some(m.to) &&
+                    (q.question_request.as_ref().is_some_and(|r| r.answers.is_none()) || q.approval_request.as_ref().is_some_and(|r| r.decision.is_none())))))));
+            if let Some(id) = eligible.and_then(|index| board.queue.remove(index)) {
                 if let Some(mail) = board
                     .mailbox
                     .iter_mut()
@@ -1047,7 +1132,6 @@ pub async fn execute(mut plan: TeamPlan, emitter: Emitter, cancel: CancellationT
                 {
                     mail.state = MailState::Delivered;
                     next = Some(mail.clone());
-                    break;
                 }
             }
             next
@@ -1147,7 +1231,7 @@ pub async fn execute(mut plan: TeamPlan, emitter: Emitter, cancel: CancellationT
         let mut turn = emitter.clone();
         turn.turn = Some(message_id);
         let provider = coworker(&plan.chat, mail.to).provider;
-        let (status, raw, session) = if let Some(agent) = plan.agents.get_mut(&mail.to) {
+        let (provider_status, raw, session) = if let Some(agent) = plan.agents.get_mut(&mail.to) {
             message.model = agent.tasks[0].config.model.clone();
             message.effort = agent.tasks[0].config.effort;
             let previous = plan
@@ -1183,19 +1267,34 @@ pub async fn execute(mut plan: TeamPlan, emitter: Emitter, cancel: CancellationT
             (Status::Failed, message.text.clone(), None)
         };
         plan.control.0.lock().unwrap().current.remove(&mail.id);
-        failed |= status == Status::Failed;
+        let mut status = if turn_cancel.is_cancelled() { Status::Cancelled } else { provider_status };
         let (raw, question) = questions::extract(&raw);
         let (mut raw, mut approval) = approval(&raw);
         if question.is_some() && approval.is_some() {
             approval = None;
             raw.push_str("\nCommand approval was deferred until the clarification is answered. Request it again in a later turn.");
         }
-        let (visible, requests) = dispatches(&raw, mail.to, &plan.chat);
+        let (mut visible, requests) = dispatches(&raw, mail.to, &plan.chat);
+        let mut delegated = None;
+        if mail.kind == MailKind::QuestionAnswer && status == Status::Completed && question.is_none() && approval.is_none() {
+            let result = (|| -> Result<_> {
+                let target = mail.question_target.clone().ok_or_else(|| anyhow::anyhow!("The delegated question reference is missing."))?;
+                let request = plan.chat.messages.iter().find(|m| m.id == target.message_id)
+                    .and_then(|m| m.question_request.as_ref()).filter(|r| r.id == target.request_id)
+                    .ok_or_else(|| anyhow::anyhow!("The original question is no longer available."))?;
+                let (text, answers) = questions::extract_answers(&visible, request)?;
+                Ok((target, text, answers))
+            })();
+            match result {
+                Ok((target, text, answers)) => { visible = text; delegated = Some((target, answers)); }
+                Err(error) => { status = Status::Failed; message.error = Some(format!("Could not use this teammate's answers: {error}")); }
+            }
+        }
         message.text = visible.clone();
         message.status = status;
         message.question_request = question.clone();
         message.approval_request = approval.clone();
-        if status == Status::Completed {
+        if provider_status == Status::Completed {
             turn.send(Message::ChatStage {
                 run_id: plan.run_id,
                 message_id,
@@ -1223,6 +1322,35 @@ pub async fn execute(mut plan: TeamPlan, emitter: Emitter, cancel: CancellationT
             }
         }
         plan.chat.messages.push(message);
+        if let Some((target, answers)) = delegated {
+            (plan.chat.coworkers, plan.chat.mailbox) = plan.control.snapshot();
+            match resolve_delegated(&mut plan.chat, &target, mail.to, &answers) {
+                Ok(()) => {
+                    let resolved = plan.chat.messages.iter().find(|m| m.id == target.message_id).unwrap().question_request.clone();
+                    let answer = plan.chat.messages.last().unwrap().clone();
+                    {
+                        let mut board = plan.control.0.lock().unwrap();
+                        let resumed = plan.chat.mailbox.iter().find(|m| m.response_id == Some(target.message_id)).unwrap();
+                        if let Some(waiting) = board.mailbox.iter_mut().find(|m| m.id == resumed.id) { *waiting = resumed.clone(); }
+                        board.queue.push_front(resumed.id);
+                    }
+                    emitter.send(Message::TeamQuestion { run_id: plan.run_id, message_id: target.message_id, question: resolved, approval: None }).await;
+                    emitter.send(Message::ChatAppend { run_id: plan.run_id, message: Box::new(answer) }).await;
+                }
+                Err(error) => {
+                    status = Status::Failed;
+                    let message = plan.chat.messages.iter_mut().find(|m| m.id == message_id).unwrap();
+                    message.status = status;
+                    message.error = Some(format!("The original questions remain open: {error}"));
+                }
+            }
+        }
+        if status != provider_status {
+            turn.send(Message::ChatStage { run_id: plan.run_id, message_id, provider, event: StageEvent::Finished {
+                status, error: plan.chat.messages.iter().find(|m| m.id == message_id).and_then(|m| m.error.clone())
+            }}).await;
+        }
+        failed |= status == Status::Failed;
         let path = plan.workspace.clone();
         let previous = plan.changes.clone();
         let owner = mail.to;
@@ -1278,7 +1406,7 @@ pub async fn execute(mut plan: TeamPlan, emitter: Emitter, cancel: CancellationT
             mail.kind,
             MailKind::DiscussionLead | MailKind::DiscussionReview | MailKind::DiscussionSummary
         );
-        if !discussion && status == Status::Completed {
+        if !discussion && mail.kind != MailKind::QuestionAnswer && status == Status::Completed {
             for (to, text) in requests {
                 if sent.insert((mail.exchange_id, Some(mail.to), to, text.clone()))
                     && !plan.control.add(
@@ -1343,6 +1471,7 @@ pub async fn execute(mut plan: TeamPlan, emitter: Emitter, cancel: CancellationT
         plan.control.publish(plan.run_id, &emitter).await;
         plan.chat.bound();
     }
+    waiting |= pending(&plan.chat);
     {
         let mut board = plan.control.0.lock().unwrap();
         board.accepting = false;

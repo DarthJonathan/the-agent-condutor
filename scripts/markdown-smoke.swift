@@ -51,15 +51,13 @@ enum MarkdownSmoke {
         print("Markdown checks passed: tables, alignment, escaped pipes, nested and numbered lists, tasks, quotes, dividers, links, inline formatting, code, and streamed prefixes")
 
         if CommandLine.arguments.contains("--render") {
-            let store = EngineStore(options: LaunchOptions())
-            let content = VStack(alignment: .leading, spacing: 15) {
-                ForEach(blocks) { ResponseBlockContent(block: $0) }
-            }.padding(28).frame(width: 760, alignment: .leading).background(Theme.panel)
-                .environmentObject(store).environment(\.colorScheme, .dark).tint(Theme.accent)
-            let renderer = ImageRenderer(content: content)
-            renderer.scale = 2
-            guard let image = renderer.cgImage,
-                  let data = NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:]) else { fatalError("Markdown layout rendering failed") }
+            let view = ResponseTextView()
+            view.appearance = NSAppearance(named: .darkAqua)
+            view.apply(.markdown(blocks))
+            view.setFrameSize(view.measuredSize(width: 760))
+            guard let bitmap = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { fatalError("Markdown layout rendering failed") }
+            view.cacheDisplay(in: view.bounds, to: bitmap)
+            guard let data = bitmap.representation(using: .png, properties: [:]) else { fatalError("Markdown bitmap encoding failed") }
             let destination = root.appendingPathComponent("target/markdown-preview.png")
             try data.write(to: destination)
             print("Rendered \(destination.path)")
