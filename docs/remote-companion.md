@@ -73,6 +73,38 @@ docker compose --profile https up -d --build
 
 Caddy terminates TLS and forwards streaming HTTP to the web app. Alternatively, use an existing TLS reverse proxy on the same host against `127.0.0.1:3005`; preserve streaming responses and the configured public origin. Do not publish the database or backend container ports. This project uses its own `conductor_*` tables and volume; it does not share expense_tracker's database or deployment.
 
+### Published GHCR images
+
+`.github/workflows/remote-containers.yml` runs backend tests with PostgreSQL and the Go race detector, frontend protocol and type checks, and validation of the development and GHCR Compose configurations. Pull requests also build both Dockerfiles without registry credentials. After checks pass, pushes to `main`, `v*` tags and manual runs on `main` or a version tag publish both Linux AMD64 and ARM64 images:
+
+- `ghcr.io/darthjonathan/the-agent-condutor-backend`
+- `ghcr.io/darthjonathan/the-agent-condutor-frontend`
+
+Names follow the lowercase GitHub repository, so forks use their own namespace. The workflow uses the [built-in `GITHUB_TOKEN` with `packages: write`](https://docs.github.com/en/actions/tutorials/publish-packages/publish-docker-images), SHA-pinned official actions, component-specific build caches, SBOMs and BuildKit provenance. No personal access token is needed for the publishing workflow. The first run requires these files and both application folders to be committed and pushed; local changes do not publish anything.
+
+Main builds receive `main`, `latest` and `sha-<full-commit>` tags. A version tag such as `v0.2.1` receives `0.2.1`, `0.2` and its SHA tag; version tags do not move `latest`. Choose the same version or commit tag for both services. Published digests appear in each workflow job's summary.
+
+To use these images on the HTTPS server, keep the hosted settings above and add the following to that server's private `.env`:
+
+```dotenv
+COMPOSE_FILE=docker-compose.yml:deploy/compose.ghcr.yml
+CONDUCTOR_IMAGE_PREFIX=ghcr.io/darthjonathan/the-agent-condutor
+CONDUCTOR_IMAGE_TAG=sha-REPLACE_WITH_THE_PUBLISHED_FULL_COMMIT
+```
+
+The Compose override removes frontend/backend build definitions, requires an explicit published tag, and forces production mode with public signup disabled. Use a current Docker Compose version with [`!reset` support](https://docs.docker.com/reference/compose-file/merge/#reset-value). Keep the repository's Compose and Caddy files on the server; the application source is not compiled there.
+
+New [GHCR packages are private by default](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry#pushing-container-images). For private images, authenticate on the server using a GitHub personal access token (classic) with `read:packages` and permission to those packages; use `docker login ghcr.io --username YOUR_GITHUB_USER --password-stdin`. Public packages can be pulled without login. Do not place this token in Compose, image build arguments or the repository. GitHub package settings control visibility and repository access.
+
+Deploy or update the selected image tag:
+
+```sh
+docker compose --profile https pull
+docker compose --profile https up -d --no-build
+```
+
+The `COMPOSE_FILE` setting also makes the account-provisioning command below use the published backend image. Changing `CONDUCTOR_IMAGE_TAG` to an earlier published version and running these commands again rolls back the application containers; PostgreSQL data remains in its volume. This workflow publishes containers to GHCR; it does not connect to or restart a hosted server automatically.
+
 Production has no open signup or default account. Provision an account without placing its password in argv or committing it:
 
 ```sh

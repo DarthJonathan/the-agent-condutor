@@ -341,10 +341,14 @@ The SwiftUI app targets macOS. Linux and Windows builds of the Rust fallback rem
 | `backend/` | Go/PostgreSQL authentication, device pairing, command queue and event relay |
 | `frontend/` | SvelteKit remote workspace, same-origin HTTP proxy and live chat |
 | `docker-compose.yml` | Separate Conductor database, API, web app and optional Caddy HTTPS gateway |
+| `.github/workflows/remote-containers.yml` | Frontend/backend checks and GHCR images for AMD64 and ARM64 |
+| `deploy/compose.ghcr.yml` | Hosted deployment using the published images |
 
 ## Remote companion
 
 The same repository now contains a Go/PostgreSQL relay in `backend/`, a SvelteKit browser app in `frontend/`, and `docker-compose.yml`. Remote access requires login and explicit folder sharing in the Mac app's **Remote** screen. The laptop initiates HTTP connections to the relay; web commands reuse the same local engine and coworker sessions. Provider credentials stay local.
+
+GitHub Actions in `.github/workflows/remote-containers.yml` validate both apps and publish separate frontend/backend images to GHCR for Linux AMD64 and ARM64 on `main` updates, version tags or manual runs on those refs. Pull requests validate without publishing. Hosted servers can pull the same version of both images using `deploy/compose.ghcr.yml`; see [GHCR deployment instructions](docs/remote-companion.md#published-ghcr-images).
 
 ```sh
 bash scripts/remote-dev.sh

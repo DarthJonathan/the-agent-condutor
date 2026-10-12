@@ -1,0 +1,16 @@
+# Combine with docker-compose.yml to run the images published by GitHub Actions.
+services:
+  backend:
+    build: !reset null
+    image: ${CONDUCTOR_IMAGE_PREFIX:?Set the lowercase ghcr.io/owner/repository prefix}-backend:${CONDUCTOR_IMAGE_TAG:?Select a published image tag}
+    pull_policy: always
+    environment:
+      DEVELOPMENT: 'false'
+      ALLOW_SIGNUP: 'false'
+      PUBLIC_ORIGIN: ${PUBLIC_ORIGIN:?Set the public HTTPS origin}
+  frontend:
+    build: !reset null
+    image: ${CONDUCTOR_IMAGE_PREFIX:?Set the lowercase ghcr.io/owner/repository prefix}-frontend:${CONDUCTOR_IMAGE_TAG:?Select a published image tag}
+    pull_policy: always
+    environment:
+      ORIGIN: ${PUBLIC_ORIGIN:?Set the public HTTPS origin}
