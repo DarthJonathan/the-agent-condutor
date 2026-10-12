@@ -1,0 +1,6 @@
+{
+  "name": "conductor-web", "private": true, "version": "0.1.0", "type": "module",
+  "scripts": { "dev": "vite --host 127.0.0.1", "build": "vite build", "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json", "test": "node --experimental-strip-types --test src/lib/protocol.test.ts" },
+  "dependencies": { "dompurify": "^3.2.7", "marked": "^15.0.12" },
+  "devDependencies": { "@sveltejs/adapter-node": "^5.5.4", "@sveltejs/kit": "^2.43.5", "@sveltejs/vite-plugin-svelte": "^7.0.0", "@types/node": "^22.0.0", "svelte": "^5.43.3", "svelte-check": "^4.3.4", "typescript": "^5.9.3", "vite": "^8.0.0" }
+}

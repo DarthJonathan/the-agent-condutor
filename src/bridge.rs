@@ -31,6 +31,11 @@ use uuid::Uuid;
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Command {
+    #[serde(rename = "remote_command")]
+    RemoteDispatch {
+        request_id: Uuid,
+        command: Box<Command>,
+    },
     TeamChat {
         run_id: Option<Uuid>,
         prompt: String,
@@ -148,6 +153,12 @@ enum Command {
     GetRun {
         run_id: Uuid,
     },
+    DismissAttention {
+        items: Vec<crate::inbox::Dismissal>,
+    },
+    DeleteRun {
+        run_id: Uuid,
+    },
     Export {
         run_id: Uuid,
     },
@@ -166,17 +177,8 @@ pub struct RunSummary {
     names: Vec<AgentIdentity>,
     total_tokens: u64,
     coworkers: Vec<team::Coworker>,
-    attention: Vec<AttentionItem>,
+    attention: Vec<crate::inbox::Item>,
     execution_workspace: String,
-}
-
-#[derive(Serialize)]
-struct AttentionItem {
-    id: Uuid,
-    message_id: Option<Uuid>,
-    owner_id: Option<Uuid>,
-    kind: &'static str,
-    title: String,
 }
 
 impl From<&Run> for RunSummary {
@@ -193,48 +195,7 @@ impl From<&Run> for RunSummary {
                 .conversation
                 .as_ref()
                 .map_or_else(Vec::new, |c| c.coworkers.clone()),
-            attention: run.conversation.as_ref().map_or_else(Vec::new, |chat| {
-                let mut items = vec![];
-                for message in &chat.messages {
-                    if let Some(question) = &message.question_request
-                        && question.answers.is_none()
-                    {
-                        items.push(AttentionItem {
-                            id: question.id,
-                            message_id: Some(message.id),
-                            owner_id: message.author_id,
-                            kind: "question",
-                            title: question
-                                .questions
-                                .first()
-                                .map_or("Needs your answer".into(), |q| q.question.clone()),
-                        });
-                    }
-                    if let Some(approval) = &message.approval_request
-                        && approval.decision.is_none()
-                    {
-                        items.push(AttentionItem {
-                            id: approval.id,
-                            message_id: Some(message.id),
-                            owner_id: message.author_id,
-                            kind: "approval",
-                            title: approval.summary.clone(),
-                        });
-                    }
-                }
-                for c in &chat.coworkers {
-                    if c.attention == team::Attention::ReadyForReview {
-                        items.push(AttentionItem {
-                            id: c.id,
-                            message_id: None,
-                            owner_id: Some(c.id),
-                            kind: "review",
-                            title: format!("{}'s changes are ready for review", c.name),
-                        });
-                    }
-                }
-                items
-            }),
+            attention: crate::inbox::items(run),
             workflow: run.workflow,
             created_at: run.created_at,
             status: run.status,
@@ -292,6 +253,9 @@ fn agent_info(agents: &HashMap<Provider, Availability>) -> Vec<AgentInfo> {
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Event<'a> {
+    SettingsUpdated {
+        settings: &'a Settings,
+    },
     TeamQueued {
         run_id: Uuid,
     },
@@ -319,17 +283,49 @@ enum Event<'a> {
     RunDetail {
         run: &'a Run,
     },
+    AttentionDismissed {
+        items: Vec<crate::inbox::Dismissal>,
+    },
+    RunDeleted {
+        run_id: Uuid,
+    },
     Notice {
         message: String,
         error: bool,
     },
 }
 
-async fn emit(output: &mut tokio::io::Stdout, event: Event<'_>) -> Result<()> {
+struct Output {
+    stream: tokio::io::Stdout,
+    remote: Option<Uuid>,
+}
+async fn emit(output: &mut Output, event: Event<'_>) -> Result<()> {
+    let receipt = match &event {
+        Event::Notice { message, error } => Some((*error, message.clone())),
+        Event::RunUpdated { .. } | Event::TeamQueued { .. } => {
+            Some((false, "Accepted by the local engine".into()))
+        }
+        _ => None,
+    };
     let mut bytes = serde_json::to_vec(&event)?;
     bytes.push(b'\n');
-    output.write_all(&bytes).await?;
-    output.flush().await?;
+    output.stream.write_all(&bytes).await?;
+    if let Some((error, message)) = receipt {
+        acknowledge_remote(output, error, &message).await?;
+    }
+    output.stream.flush().await?;
+    Ok(())
+}
+
+async fn acknowledge_remote(output: &mut Output, error: bool, message: &str) -> Result<()> {
+    if let Some(id) = output.remote.take() {
+        let mut bytes = serde_json::to_vec(
+            &serde_json::json!({"type":"remote_result","request_id":id,"error":error,"message":message}),
+        )?;
+        bytes.push(b'\n');
+        output.stream.write_all(&bytes).await?;
+    }
+    output.stream.flush().await?;
     Ok(())
 }
 
@@ -417,7 +413,10 @@ async fn serve(data_dir: Option<PathBuf>, demo: bool) -> Result<()> {
     let mut changed = HashSet::new();
     let mut dirty = false;
     let mut last_save = tokio::time::Instant::now();
-    let mut output = tokio::io::stdout();
+    let mut output = Output {
+        stream: tokio::io::stdout(),
+        remote: None,
+    };
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     let mut ticks = tokio::time::interval(Duration::from_millis(100));
     let snapshot =
@@ -442,6 +441,7 @@ async fn serve(data_dir: Option<PathBuf>, demo: bool) -> Result<()> {
         scan(&settings, &key, &claude_key, generation, &emitter);
     }
     loop {
+        output.remote = None;
         tokio::select! {
             line = lines.next_line() => {
                 let Some(line) = line.context("Could not read the frontend request")? else { break; };
@@ -452,7 +452,12 @@ async fn serve(data_dir: Option<PathBuf>, demo: bool) -> Result<()> {
                     Ok(command) => command,
                     Err(message) => { emit(&mut output, Event::Notice { message, error: true }).await?; continue; }
                 };
+                let command = match command {
+                    Command::RemoteDispatch { request_id, command } => { output.remote = Some(request_id); *command },
+                    command => command,
+                };
                 match command {
+                    Command::RemoteDispatch { .. } => { emit(&mut output, Event::Notice { message: "Nested remote commands are not allowed".into(), error: true }).await?; },
                     Command::TeamChat { run_id, prompt, lead_id, target_id, settings: next, coworkers, discussion, isolation } => {
                         if demo { emit(&mut output, Event::Notice { message: "Demo mode cannot start agents".into(), error: true }).await?; continue; }
                         if let Some(id) = run_id && let Some(control) = team_controls.get(&id) && active.contains_key(&id) {
@@ -529,7 +534,7 @@ async fn serve(data_dir: Option<PathBuf>, demo: bool) -> Result<()> {
                             let validation = (|| -> Result<()> {
                                 let worker = proposed.iter_mut().find(|c| c.id == coworker.id).ok_or_else(|| anyhow::anyhow!("Choose a coworker in this chat."))?;
                                 if worker.provider != coworker.provider { anyhow::bail!("A saved coworker's connection is fixed. Create a new chat to change it."); }
-                                let attention = worker.attention; let waiting_for = worker.waiting_for; *worker = coworker; worker.attention = attention; worker.waiting_for = waiting_for;
+                                let attention = worker.attention; let waiting_for = worker.waiting_for; let review_id = worker.review_id; *worker = coworker; worker.attention = attention; worker.waiting_for = waiting_for; worker.review_id = review_id;
                                 team::validate_roster(&mut proposed)?;
                                 for c in &proposed {
                                     let model = if c.model.is_empty() { settings.agents.iter().find(|a| a.provider == c.provider).map_or("", |a| a.model.as_str()) } else { &c.model };
@@ -580,6 +585,7 @@ async fn serve(data_dir: Option<PathBuf>, demo: bool) -> Result<()> {
                         settings = next;
                         settings.repair();
                         dirty = true;
+                        emit(&mut output, Event::SettingsUpdated { settings: &settings }).await?;
                         let snapshot = claude_config::inspect(&settings.workspace, &settings.claude_config_dir).snapshot;
                         let model_catalogs = model_catalog::catalogs(&settings, &snapshot);
                         emit(&mut output, Event::ClaudeConfigUpdated { claude_config: snapshot, model_catalogs }).await?;
@@ -733,7 +739,36 @@ async fn serve(data_dir: Option<PathBuf>, demo: bool) -> Result<()> {
                         }
                     }
                     Command::Cancel { run_id } => {
-                        if let Some((token, _)) = active.get(&run_id) { token.cancel(); }
+                        if let Some((token, _)) = active.get(&run_id) {
+                            token.cancel();
+                            acknowledge_remote(&mut output, false, "Cancellation requested").await?;
+                        } else {
+                            let exists = runs.iter().any(|run| run.id == run_id);
+                            acknowledge_remote(&mut output, !exists, if exists { "Task is already idle" } else { "This chat is no longer in history" }).await?;
+                        }
+                    }
+                    Command::DismissAttention { items } => {
+                        if demo || persistence_blocked { emit(&mut output, Event::Notice { message: "Inbox changes cannot be saved right now.".into(), error: true }).await?; continue; }
+                        let previous = runs.iter().map(|r| r.dismissed_attention.clone()).collect::<Vec<_>>();
+                        let accepted = crate::inbox::dismiss(&mut runs, &items);
+                        match store.save(&settings, &runs) {
+                            Ok(()) => { dirty = false; last_save = tokio::time::Instant::now(); emit(&mut output, Event::AttentionDismissed { items: accepted }).await?; },
+                            Err(error) => {
+                                for (run, keys) in runs.iter_mut().zip(previous) { run.dismissed_attention = keys; }
+                                emit(&mut output, Event::Notice { message: format!("Could not clear inbox: {error:#}"), error: true }).await?;
+                            }
+                        }
+                    }
+                    Command::DeleteRun { run_id } => {
+                        if demo || persistence_blocked { emit(&mut output, Event::Notice { message: "Chats cannot be deleted while saved state is unavailable.".into(), error: true }).await?; continue; }
+                        match delete_saved_run(&store, &settings, &mut runs, run_id, active.contains_key(&run_id)) {
+                            Ok(()) => {
+                                changed.remove(&run_id); team_controls.remove(&run_id);
+                                dirty = false; last_save = tokio::time::Instant::now();
+                                emit(&mut output, Event::RunDeleted { run_id }).await?;
+                            },
+                            Err(error) => emit(&mut output, Event::Notice { message: error.to_string(), error: true }).await?,
+                        }
                     }
                     Command::GetRun { run_id } => {
                         if let Some(run) = runs.iter().find(|r| r.id == run_id) {
@@ -853,6 +888,31 @@ async fn serve(data_dir: Option<PathBuf>, demo: bool) -> Result<()> {
     if !demo && !persistence_blocked {
         store.save(&settings, &runs)?;
     }
+    Ok(())
+}
+
+fn delete_saved_run(
+    store: &Store,
+    settings: &Settings,
+    runs: &mut Vec<Run>,
+    id: Uuid,
+    active: bool,
+) -> Result<()> {
+    let Some(index) = runs.iter().position(|r| r.id == id) else {
+        // A duplicate request still acknowledges the current persisted state.
+        return store
+            .save(settings, runs)
+            .context("Could not save chat deletion");
+    };
+    if active || !runs[index].status.terminal() {
+        anyhow::bail!("Stop this chat and wait for its agents to finish before deleting it.");
+    }
+    let removed = runs.remove(index);
+    if let Err(error) = store.save(settings, runs) {
+        runs.insert(index, removed);
+        return Err(error.context("Could not delete the saved chat"));
+    }
+    // Deleting dashboard history never removes a project, worktree or provider session.
     Ok(())
 }
 
@@ -1023,7 +1083,12 @@ fn apply_chat(runs: &mut [Run], event: Message) -> Option<Uuid> {
             ..
         } => {
             let message = chat.messages.iter_mut().find(|m| m.id == message_id)?;
-            message.status = if question.as_ref().is_some_and(|q| q.answers.is_some()) && approval.is_none() { Status::Completed } else { Status::WaitingForUser };
+            message.status =
+                if question.as_ref().is_some_and(|q| q.answers.is_some()) && approval.is_none() {
+                    Status::Completed
+                } else {
+                    Status::WaitingForUser
+                };
             message.question_request = question;
             message.approval_request = approval;
         }
@@ -1048,4 +1113,62 @@ fn apply_chat(runs: &mut [Run], event: Message) -> Option<Uuid> {
         chat.bound();
     }
     Some(id)
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+
+    #[test]
+    fn deletion_persists_keeps_workspace_and_ignores_late_updates() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(Some(dir.path().join("state")));
+        let settings = Settings::default();
+        let mut runs = demo_runs(&settings);
+        let id = runs[0].id;
+        let workspace_file = dir.path().join("source.rs");
+        let mut other = runs[0].clone();
+        other.id = Uuid::new_v4();
+        runs.push(other);
+        std::fs::write(&workspace_file, "keep me").unwrap();
+        runs[0].workspace = dir.path().to_string_lossy().into();
+        store.save(&settings, &runs).unwrap();
+        let count = runs.len();
+        delete_saved_run(&store, &settings, &mut runs, id, false).unwrap();
+        assert_eq!(runs.len(), count - 1);
+        assert!(store.load_runs().unwrap().iter().all(|r| r.id != id));
+        assert_eq!(std::fs::read_to_string(workspace_file).unwrap(), "keep me");
+        assert!(
+            apply_chat(
+                &mut runs,
+                Message::Changes {
+                    run_id: id,
+                    changes: Default::default()
+                }
+            )
+            .is_none()
+        );
+        runs[0].prompt = "Other chat progress".into();
+        delete_saved_run(&store, &settings, &mut runs, id, false).unwrap();
+        assert_eq!(runs.len(), count - 1);
+        assert_eq!(store.load_runs().unwrap()[0].prompt, "Other chat progress");
+    }
+
+    #[test]
+    fn deletion_rejects_live_work_and_restores_history_on_save_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(Some(dir.path().join("state")));
+        let settings = Settings::default();
+        let mut runs = demo_runs(&settings);
+        let id = runs[0].id;
+        assert!(delete_saved_run(&store, &settings, &mut runs, id, true).is_err());
+        let status = runs[0].status;
+        runs[0].status = Status::Running;
+        assert!(delete_saved_run(&store, &settings, &mut runs, id, false).is_err());
+        runs[0].status = status;
+        std::fs::write(&store.root, "not a directory").unwrap();
+        let order = runs.iter().map(|r| r.id).collect::<Vec<_>>();
+        assert!(delete_saved_run(&store, &settings, &mut runs, id, false).is_err());
+        assert_eq!(runs.iter().map(|r| r.id).collect::<Vec<_>>(), order);
+    }
 }

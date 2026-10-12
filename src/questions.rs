@@ -160,7 +160,11 @@ impl QuestionRequest {
                     text.push_str(&format!("Selected: {}\n", option.label));
                 }
                 if !answer.text.is_empty() {
-                    text.push_str(&format!("{} answer: {}\n", coworker.unwrap_or("User"), answer.text));
+                    text.push_str(&format!(
+                        "{} answer: {}\n",
+                        coworker.unwrap_or("User"),
+                        answer.text
+                    ));
                 }
             }
         }
@@ -200,7 +204,10 @@ impl QuestionRequest {
 }
 
 /// Only an explicit, unfenced envelope for this request can resolve its choices.
-pub fn extract_answers(output: &str, request: &QuestionRequest) -> Result<(String, Vec<QuestionAnswer>)> {
+pub fn extract_answers(
+    output: &str,
+    request: &QuestionRequest,
+) -> Result<(String, Vec<QuestionAnswer>)> {
     #[derive(Deserialize)]
     struct Reply {
         request_id: Uuid,
@@ -217,17 +224,25 @@ pub fn extract_answers(output: &str, request: &QuestionRequest) -> Result<(Strin
             fenced = !fenced;
         }
         if !fenced && line.trim() == "<conductor-answer>" {
-            if answers.is_some() { bail!("Return one answer envelope for the delegated questions."); }
-            let close = remaining[end..].find("</conductor-answer>")
+            if answers.is_some() {
+                bail!("Return one answer envelope for the delegated questions.");
+            }
+            let close = remaining[end..]
+                .find("</conductor-answer>")
                 .ok_or_else(|| anyhow::anyhow!("The teammate's answer envelope was incomplete."))?;
             let body = &remaining[end..end + close];
             let tail = &remaining[end + close..];
             let close_end = tail.find('\n').map_or(tail.len(), |i| i + 1);
-            if body.len() > 64 * 1024 || !body.ends_with('\n') || tail[..close_end].trim() != "</conductor-answer>" {
+            if body.len() > 64 * 1024
+                || !body.ends_with('\n')
+                || tail[..close_end].trim() != "</conductor-answer>"
+            {
                 bail!("Use a complete answer envelope on its own lines, below 64 KiB.");
             }
             let reply: Reply = serde_json::from_str(body)?;
-            if reply.request_id != request.id { bail!("The teammate answered a different question request."); }
+            if reply.request_id != request.id {
+                bail!("The teammate answered a different question request.");
+            }
             answers = Some(request.validate_answers(&reply.answers)?);
             remaining = &tail[close_end..];
             continue;
@@ -235,7 +250,14 @@ pub fn extract_answers(output: &str, request: &QuestionRequest) -> Result<(Strin
         visible.push_str(line);
         remaining = &remaining[end..];
     }
-    Ok((visible.trim().into(), answers.ok_or_else(|| anyhow::anyhow!("The teammate did not return structured answers. The questions remain open."))?))
+    Ok((
+        visible.trim().into(),
+        answers.ok_or_else(|| {
+            anyhow::anyhow!(
+                "The teammate did not return structured answers. The questions remain open."
+            )
+        })?,
+    ))
 }
 
 /// Explicit own-line envelopes only. Examples, quotes, malformed JSON and partial blocks stay text.
@@ -352,5 +374,52 @@ mod tests {
         let mut answered = request;
         answered.answers = Some(answers.clone());
         assert!(answered.validate_answers(&answers).is_err());
+    }
+
+    #[test]
+    fn teammate_envelopes_are_scoped_and_validate_every_answer() {
+        let request = example();
+        let value = json!({"request_id":request.id,"answers":[
+            {"question_id":"q1","option_ids":["o1"]},
+            {"question_id":"q2","option_ids":["o2","o1"],"text":"Verified against the workspace"},
+            {"question_id":"q3","skipped":true}
+        ]});
+        let envelope = format!("<conductor-answer>\n{value}\n</conductor-answer>");
+        let (text, answers) =
+            extract_answers(&format!("My findings.\n{envelope}"), &request).unwrap();
+        assert_eq!(text, "My findings.");
+        assert_eq!(answers[1].option_ids, ["o1", "o2"]);
+        for output in [
+            format!("```json\n{envelope}\n```"),
+            format!("Example: {envelope}"),
+            format!("{envelope}\n{envelope}"),
+            "<conductor-answer>\n{}".into(),
+        ] {
+            assert!(extract_answers(&output, &request).is_err());
+        }
+        for mutation in [
+            "wrong_request",
+            "invalid_option",
+            "missing_answer",
+            "duplicate_answer",
+        ] {
+            let mut wrong = value.clone();
+            match mutation {
+                "wrong_request" => wrong["request_id"] = json!(Uuid::new_v4()),
+                "invalid_option" => wrong["answers"][0]["option_ids"] = json!(["unknown"]),
+                "missing_answer" => {
+                    wrong["answers"].as_array_mut().unwrap().pop();
+                }
+                _ => wrong["answers"][1]["question_id"] = json!("q1"),
+            }
+            assert!(
+                extract_answers(
+                    &format!("<conductor-answer>\n{wrong}\n</conductor-answer>"),
+                    &request
+                )
+                .is_err()
+            );
+        }
+        assert!(request.answers.is_none());
     }
 }

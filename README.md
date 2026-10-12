@@ -1,6 +1,6 @@
 # Agent Conductor
 
-A macOS agent workspace for Claude Code, Codex, Antigravity, Qoder, DeepSeek, and Kiro. The primary interface is native SwiftUI; a Rust/Tokio engine supervises headless processes and streamed API requests. The two processes communicate through local JSON pipes, with decoding and response formatting off the UI thread. No Node.js frontend or web server is required.
+A macOS agent workspace for Claude Code, Codex, Antigravity, Qoder, DeepSeek, and Kiro. The primary interface is native SwiftUI; a Rust/Tokio engine supervises headless processes and streamed API requests. A background host connects the native app through private local IPC, with decoding and response formatting off the UI thread. The desktop works independently; the optional web companion adds authenticated remote access.
 
 ## Run
 
@@ -89,7 +89,7 @@ Chat saves native session IDs per task and agent. Claude/DeepSeek and Qoder use 
 
 Each teammate has an **Effort** menu below their model in **Your coworkers**. The choice is saved for that person in the chat and applies to their next direct reply, mention, teammate request or discussion turn. **Default** inherits the connection's **Default reasoning effort**, or leaves its CLI/provider default in charge. Connections defaults also apply to Parallel and Handoff runs. Old settings and conversations keep Default without changing their saved session scopes. Replies show the requested explicit effort; provider or organization limits can still cap the actual level.
 
-Effort uses each provider's native control: [Claude Code](https://code.claude.com/docs/en/model-config#adjust-effort-level), [Kiro V3](https://kiro.dev/docs/models/), and [Antigravity](https://www.antigravity.google/docs/cli/headless/#select-a-model-effort-or-agent) use `--effort`; [Qoder](https://docs.qoder.com/cli/model) uses `--reasoning-effort`; [Codex](https://developers.openai.com/codex/config-reference/) uses a per-invocation `model_reasoning_effort` config override. Codex levels come from the selected model's local `models_cache.json` capability metadata; models without advertised levels offer a conservative range. DeepSeek offers Low / High / Max through Claude Code, with `CLAUDE_CODE_EFFORT_LEVEL` applied to the child and its private settings file. Its [direct API](https://api-docs.deepseek.com/guides/thinking_mode/) sends `reasoning_effort` and also offers Off. Antigravity offers Low / Medium / High; Claude, Qoder, and Kiro expose their documented CLI levels and apply model limits. Known older Claude models without adaptive effort offer Default only. Unsupported choices and conflicting additional effort flags are rejected before the affected agent runs. Selecting effort never invokes a model or edits terminal CLI configuration.
+Effort uses each provider's native control: [Claude Code](https://code.claude.com/docs/en/model-config#adjust-effort-level), [Kiro V3](https://kiro.dev/docs/models/), and [Antigravity](https://www.antigravity.google/docs/cli/headless/#select-a-model-effort-or-agent) use `--effort`; [Qoder](https://docs.qoder.com/cli/model) uses `--reasoning-effort`; [Codex](https://learn.chatgpt.com/docs/agent-configuration/subagents#reasoning-effort-model_reasoning_effort) uses a per-invocation `model_reasoning_effort` config override. Codex levels come from the selected model's local `models_cache.json` capability metadata, including Max and Ultra when advertised. Default, custom models and models without capability metadata offer Low / Medium / High / Extra high / Max; Codex validates model and account limits when invoked. DeepSeek offers Low / High / Max through Claude Code, with `CLAUDE_CODE_EFFORT_LEVEL` applied to the child and its private settings file. Its [direct API](https://api-docs.deepseek.com/guides/thinking_mode/) sends `reasoning_effort` and also offers Off. Antigravity offers Low / Medium / High; Claude, Qoder, and Kiro expose their documented CLI levels and apply model limits. Known older Claude models without adaptive effort offer Default only. Unsupported choices and conflicting additional effort flags are rejected before the affected agent runs. Selecting effort never invokes a model or edits terminal CLI configuration.
 
 An agent can request a teammate through an explicit own-line block outside a code fence:
 
@@ -102,6 +102,8 @@ Rust delivers the request to that coworker's own session and returns a correlate
 Team discussion schedules one lead answer, one review per teammate, and one final lead answer directly, so it works even when an agent does not emit a dispatch block. Agents receive the current user message, the lead's answer, and shared conversation context. The final lead turn includes each review or an explicit failure notice, and asks the lead to preserve unresolved disagreements. A failed lead stops the discussion; a failed review allows the other reviews and final summary to finish while marking the task failed. Additional agent-generated requests are paused during this bounded round. The option is sent per message and recorded with the user message; it does not change provider configuration or native session scope.
 
 Agents can also ask the human for clarification in Chat. An inline card shows one to four questions, single-choice or multiple-choice options with descriptions, and a custom answer field. Nothing is selected or submitted automatically. Answer or skip every question, then **Send answers** to resume the asking agent. The chat shows **Waiting for you** while the team exchange is paused. Pending questions, answers, the original lead, and the remaining teammate schedule survive restarts. Answers go only to the question's owner; `@mentions` inside a custom answer stay ordinary answer text. Questions and selected answers are included in Markdown exports.
+
+In coworker chats, **Ask a teammate** on the question card lets you assign its questions to another available coworker. Two coworkers on the same connection remain separate choices and use their own saved sessions. The mailbox tracks the answer request; the card shows who is answering and lets you cancel a queued or running attempt. A validated answer records **Answered by [name]**, selects the returned choices or custom text, and resumes the asking coworker's session automatically. Failed, invalid or cancelled attempts leave the original questions open for a human answer or another teammate. If the answering teammate needs human clarification, their own question appears in chat; answering it resumes that teammate before returning to the original asker. Pending answer deliveries survive restart and can be continued from the card. Command approvals remain human decisions.
 
 Every headless provider receives the same question protocol. A live question uses an own-line envelope outside a code fence:
 
@@ -139,7 +141,7 @@ The card shows the exact arguments and task folder. **Approve once** executes th
 
 Before starting a chat, choose **Shared project folder**, **New isolated worktree**, or **Share another task's workspace**. Isolation creates a `codex/team-…` branch from HEAD and a checkout under the local data directory's `worktrees` folder. All coworkers in that chat deliberately share its checkout. Independent chats can use separate worktrees; explicit sharing reuses a selected task's checkout without reusing its coworkers or sessions. Original uncommitted files are left in the source folder. Isolation requires a Git repository with a commit. Branches/worktrees are preserved; merging and cleanup are manual. The UI groups an isolated chat under its original project folder.
 
-Parallel/Handoff in the Rust fallback still use their selected folder and do not automatically isolate concurrent file edits. Only one task exchange, check or batch runs at a time. The engine remains attached to the app lifecycle; always-on service and Herdr/SSH remote hosting are a later phase.
+Parallel/Handoff in the Rust fallback still use their selected folder and do not automatically isolate concurrent file edits. Only one task exchange, check or batch runs at a time. The native Mac app attaches to a background host; enabling Remote keeps it available after the desktop closes. Herdr/SSH integration is a later phase.
 
 ## Permissions and cancellation
 
@@ -167,6 +169,8 @@ Session API keys are never serialized into saved settings, history, or exports. 
 
 **Copy** copies the selected agent response. **Export** writes a Markdown report to the data directory's `exports` folder. **Use task again** prepares a new task without starting it automatically.
 
+**Clear inbox** dismisses the notifications currently visible in the Inbox; the **×** on a row dismisses just that notification. These acknowledgements are saved across restarts. Pending questions and approvals remain available in their chats, and a new question or a new review from the same coworker appears again. **Delete chat** is available in a chat's header, its sidebar context menu, and Run history. Confirming deletion permanently removes the saved conversation, mailbox and inbox entries from Conductor. Stop a working chat before deleting it. Project files, worktrees, CLI sessions and exported reports are kept.
+
 Chat and saved responses share a native Markdown renderer. Tables have aligned headers, borders, wrapping cells, and horizontal scrolling when needed. Numbered and nested lists, task checkboxes, block quotes, dividers, headings, links, and inline formatting retain their structure. Fenced and indented code keep their whitespace, with a language label and **Copy** button. Parsing runs off the UI thread and also accepts unfinished streamed Markdown; saved response text and Markdown exports remain intact.
 
 ## Development
@@ -181,7 +185,7 @@ The accepted implementation plan is delivered in five phases:
 | Changes and review | Git snapshots, colored file diffs, attribution, real check results and directed review feedback | Temporary repository, literal-command and actual exit-code tests |
 | Workspace isolation | Separate task branches/worktrees or deliberate sharing; original project grouping and dirty source preservation | Worktree, committed-diff and shared-checkout fixtures |
 
-The new team path lives in `src/team.rs`; legacy chat and Rust batch protocols remain available for compatibility. Herdr/remote hosting, a detached always-on engine, provider-native SDK approval callbacks and automatic worktree merging/cleanup are outside this phase.
+The new team path lives in `src/team.rs`; legacy chat and Rust batch protocols remain available for compatibility. The HTTP remote companion adds a detached host and browser access; its setup and storage design are described below. Herdr integration, provider-native SDK approval callbacks and automatic worktree merging/cleanup remain later work.
 
 Verify the engine/frontend transport with local executable fixtures (no model calls):
 
@@ -189,6 +193,7 @@ Verify the engine/frontend transport with local executable fixtures (no model ca
 python3 scripts/bridge-smoke.py
 python3 scripts/chat-smoke.py
 python3 scripts/team-smoke.py
+python3 scripts/inbox-smoke.py
 ```
 
 Build the SwiftUI app and run a fixture through its actual UI model and Rust connection:
@@ -205,25 +210,47 @@ SwiftUI `--capture` produces a layout preview using ImageRenderer. AppKit-backed
 Check folder selection, draft restoration, task scoping, provider switching, and credential isolation without starting an app window:
 
 ```sh
-xcrun swiftc -swift-version 5 -warnings-as-errors -target "$(uname -m)-apple-macosx14.0" -module-cache-path target/swift-module-cache macos/Models.swift macos/NativeResponseText.swift macos/MentionEditor.swift macos/EngineStore.swift macos/Views.swift scripts/workspace-smoke.swift -o target/workspace-smoke-test
+xcrun swiftc -swift-version 5 -warnings-as-errors -target "$(uname -m)-apple-macosx14.0" -module-cache-path target/swift-module-cache macos/Models.swift macos/NativeResponseText.swift macos/MentionEditor.swift macos/RemoteAccess.swift macos/EngineStore.swift macos/Views.swift scripts/workspace-smoke.swift -o target/workspace-smoke-test
 target/workspace-smoke-test
-xcrun swiftc -swift-version 5 -warnings-as-errors -target "$(uname -m)-apple-macosx14.0" -module-cache-path target/swift-module-cache macos/Models.swift macos/NativeResponseText.swift macos/MentionEditor.swift macos/EngineStore.swift macos/Views.swift scripts/team-store-smoke.swift -o target/team-store-smoke-test
+xcrun swiftc -swift-version 5 -warnings-as-errors -target "$(uname -m)-apple-macosx14.0" -module-cache-path target/swift-module-cache macos/Models.swift macos/NativeResponseText.swift macos/MentionEditor.swift macos/RemoteAccess.swift macos/EngineStore.swift macos/Views.swift scripts/team-store-smoke.swift -o target/team-store-smoke-test
 target/team-store-smoke-test
 ```
 
 For populated Inbox, question, approval, team and Changes layout previews, run `python3 scripts/team-smoke.py --prepare-swift`, then pass the printed data directory's `runs.json` to `target/team-store-smoke-test PATH/runs.json --render`. It writes `target/team-*-preview.png`; AppKit controls may appear as unsupported placeholders in ImageRenderer, while native store tests exercise their state transitions.
 
+Add `--native-preview` to render the question card's real menus and text fields in a hidden fixture window. It writes `target/team-question-native-preview.png` without opening a window on the desktop or interacting with the installed app.
+
+For Inbox dismissal/deletion state checks and native previews, pass the directory printed by `python3 scripts/inbox-smoke.py` to this fixture:
+
+```sh
+xcrun swiftc -swift-version 5 -warnings-as-errors -target "$(uname -m)-apple-macosx14.0" -module-cache-path target/swift-module-cache -O macos/Models.swift macos/NativeResponseText.swift macos/MentionEditor.swift macos/RemoteAccess.swift macos/EngineStore.swift macos/Views.swift scripts/inbox-store-smoke.swift -o target/inbox-store-smoke-test
+target/inbox-store-smoke-test PATH --native-preview
+```
+
+It verifies engine/frontend notification keys, pending question and approval preservation, confirmation state, selected and unselected chat deletion, navigation cleanup and invalidation of delayed transcript updates. Native previews are written to `target/inbox-ui-preview.png` and `target/history-ui-preview.png` using hidden fixture windows.
+
 Check UI event delivery under backpressure and response layouts:
 
 ```sh
-xcrun swiftc -swift-version 5 -warnings-as-errors -target "$(uname -m)-apple-macosx14.0" -module-cache-path target/swift-module-cache macos/Models.swift macos/NativeResponseText.swift macos/MentionEditor.swift macos/EngineStore.swift macos/Views.swift scripts/responsiveness-smoke.swift -o target/responsiveness-smoke-test
+xcrun swiftc -swift-version 5 -warnings-as-errors -target "$(uname -m)-apple-macosx14.0" -module-cache-path target/swift-module-cache macos/Models.swift macos/NativeResponseText.swift macos/MentionEditor.swift macos/RemoteAccess.swift macos/EngineStore.swift macos/Views.swift scripts/responsiveness-smoke.swift -o target/responsiveness-smoke-test
 target/responsiveness-smoke-test --delivery-only
 target/responsiveness-smoke-test --render-only
 target/responsiveness-smoke-test --offscreen-scroll
 target/responsiveness-smoke-test
 ```
 
-The delivery check queues 1,000 streaming snapshots before the main loop can consume them, preserving start, question, notice and completion events. Visual progress is coalesced per run and paced to 15 updates per second. During a live user scroll, progress waits until the gesture ends, then the latest text is delivered; the engine continues running. Questions, approvals, handoffs and terminal states bypass that hold. Checks cover all of these transitions, interleaved runs and cancellation without restoring stale progress.
+The delivery check queues 1,000 streaming snapshots before the main loop can consume them, preserving start, question, notice and completion events. Visual progress is coalesced per run and paced to 15 updates per second **before Markdown parsing**. Only one background render job runs at a time, with separate, bounded caches for interleaved chats. During user scrolling and while reading older messages, progress waits until the reader returns to the bottom or chooses **Latest**; the engine continues running. Questions, approvals, handoffs and terminal states bypass that hold. Actual viewport movement is tracked too, covering mouse wheels, momentum and scrollbar dragging without publishing state for every pixel.
+
+Check the background renderer and history-reading delivery boundary:
+
+```sh
+xcrun swiftc -swift-version 5 -warnings-as-errors -target "$(uname -m)-apple-macosx14.0" -module-cache-path target/swift-module-cache -O macos/Models.swift macos/NativeResponseText.swift macos/MentionEditor.swift macos/RemoteAccess.swift macos/EngineStore.swift macos/Views.swift scripts/renderer-delivery-smoke.swift -o target/renderer-delivery-smoke-test
+target/renderer-delivery-smoke-test
+xcrun swiftc -swift-version 5 -warnings-as-errors -target "$(uname -m)-apple-macosx14.0" -module-cache-path target/swift-module-cache -O macos/Models.swift macos/NativeResponseText.swift macos/MentionEditor.swift macos/RemoteAccess.swift macos/EngineStore.swift macos/Views.swift scripts/completed-scroll-smoke.swift -o target/completed-scroll-smoke-test
+target/completed-scroll-smoke-test
+```
+
+The renderer check coalesces 2,000 raw progress packets, holds parsing across separate scroll gestures, catches up at Latest, and checks in-flight rendering, questions, approvals and cancellation. The full-chat check draws 24 completed cards with twelve 40 KB replies through 90 Retina viewport positions, verifies that reading older replies pauses delivery, and grows a live reply twelve times to check automatic following. It writes `target/completed-scroll-preview.png`. These hidden-window checks measure layout and drawing work, not live compositor frame rates.
 
 Chat columns have concrete widths. Completed cards receive only their own content and display names, retain unchanged Markdown, and do not observe the streaming store. Question and approval controls observe it independently. Replies, errors, reasoning and activity use native selectable TextKit views, with cached text layout per response width. Streaming replies reuse unchanged formatted blocks and replace only the changed text suffix, preserving selection and existing table objects. Native text tables replace the SwiftUI Grid and its height preference loop. The transcript keeps stable card heights in an eager stack, avoiding paragraph selection overlays and lazy height estimation. Repeated follow requests coalesce and wait for layout; user scrolling pauses following until the reader returns to the bottom or chooses Latest.
 
@@ -249,7 +276,7 @@ target/streaming-text-smoke-test
 Check backward compatibility, reasoning display data, saved heartbeat cleanup, and completed-card stability during 1,000 teammate updates:
 
 ```sh
-xcrun swiftc -swift-version 5 -warnings-as-errors -target "$(uname -m)-apple-macosx14.0" -module-cache-path target/swift-module-cache macos/Models.swift macos/NativeResponseText.swift macos/MentionEditor.swift macos/EngineStore.swift macos/Views.swift scripts/response-smoke.swift -o target/response-smoke-test
+xcrun swiftc -swift-version 5 -warnings-as-errors -target "$(uname -m)-apple-macosx14.0" -module-cache-path target/swift-module-cache macos/Models.swift macos/NativeResponseText.swift macos/MentionEditor.swift macos/RemoteAccess.swift macos/EngineStore.swift macos/Views.swift scripts/response-smoke.swift -o target/response-smoke-test
 target/response-smoke-test
 ```
 
@@ -258,7 +285,7 @@ Rust decoder tests cover partial/final reasoning deduplication, public summaries
 Check Markdown parsing and render a layout fixture with tables, lists, quotes, and code:
 
 ```sh
-xcrun swiftc -swift-version 5 -warnings-as-errors -module-cache-path target/swift-module-cache macos/Models.swift macos/NativeResponseText.swift macos/MentionEditor.swift macos/EngineStore.swift macos/Views.swift scripts/markdown-smoke.swift -o target/markdown-smoke
+xcrun swiftc -swift-version 5 -warnings-as-errors -module-cache-path target/swift-module-cache macos/Models.swift macos/NativeResponseText.swift macos/MentionEditor.swift macos/RemoteAccess.swift macos/EngineStore.swift macos/Views.swift scripts/markdown-smoke.swift -o target/markdown-smoke
 target/markdown-smoke --render
 ```
 
@@ -295,9 +322,12 @@ The SwiftUI app targets macOS. Linux and Windows builds of the Rust fallback rem
 | `macos/Views.swift` | SwiftUI workspace, connection settings, history, responses and timeline |
 | `macos/MentionEditor.swift` | Native message input and teammate @ autocomplete |
 | `macos/EngineStore.swift` | Background event decoding, UI state and Rust process lifecycle |
+| `macos/RemoteAccess.swift` | Remote login, folder sharing, Keychain device credentials and optional startup |
 | `macos/Models.swift` | Shared JSON models and response formatting |
 | `macos/NativeResponseText.swift` | Cached native Markdown text layout, selectable tables, and transcript scroll tracking |
 | `src/bridge.rs` | Headless engine controller, JSON protocol and batched run updates |
+| `src/host.rs` | Background engine ownership, private socket and delivery acknowledgements |
+| `src/remote.rs` | Outbound relay connection, bounded event projection and scoped commands |
 | `src/conversation.rs` | Persistent Chat routing, shared context, teammate delivery and per-agent resumption |
 | `src/team.rs` | Stable coworker IDs, roles, correlated mailbox scheduling, independent sessions and human decisions |
 | `src/workspace.rs` | Task worktrees, Git diff snapshots, attribution and explicit supervised checks |
@@ -308,3 +338,18 @@ The SwiftUI app targets macOS. Linux and Windows builds of the Rust fallback rem
 | `src/runner.rs` | CLI discovery, process supervision, HTTPS streaming, workflow scheduling |
 | `src/providers.rs` | Provider-specific JSON/SSE decoding into shared events |
 | `src/storage.rs` | Atomic JSON persistence and Markdown exports |
+| `backend/` | Go/PostgreSQL authentication, device pairing, command queue and event relay |
+| `frontend/` | SvelteKit remote workspace, same-origin HTTP proxy and live chat |
+| `docker-compose.yml` | Separate Conductor database, API, web app and optional Caddy HTTPS gateway |
+
+## Remote companion
+
+The same repository now contains a Go/PostgreSQL relay in `backend/`, a SvelteKit browser app in `frontend/`, and `docker-compose.yml`. Remote access requires login and explicit folder sharing in the Mac app's **Remote** screen. The laptop initiates HTTP connections to the relay; web commands reuse the same local engine and coworker sessions. Provider credentials stay local.
+
+```sh
+bash scripts/remote-dev.sh
+```
+
+Open **http://localhost:3005**, create your development account, then sign in from the Mac app with the same server URL and choose folders. Public deployment requires an HTTPS domain and an owner-provisioned account; the local test stack is bound to loopback. The Mac must remain awake and online to execute work.
+
+[Remote setup, backend storage, HTTPS deployment and verification](docs/remote-companion.md) describes retention limits, the Keychain device credential, restart behavior and test commands. Chat/diff copies are visible to the relay operator; this version uses TLS rather than end-to-end encryption.

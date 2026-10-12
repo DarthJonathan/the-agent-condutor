@@ -6,6 +6,7 @@ import SwiftUI
 @main
 enum TeamStoreSmoke {
     @MainActor static func main() throws {
+        if CommandLine.arguments.contains("--native-preview") { NSApplication.shared.setActivationPolicy(.prohibited) }
         let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent("target/team-store-smoke")
         let first = root.appendingPathComponent("first")
         let second = root.appendingPathComponent("second")
@@ -18,10 +19,15 @@ enum TeamStoreSmoke {
         for index in store.settings.agents.indices { store.settings.agents[index].selected = [.claude, .codex].contains(store.settings.agents[index].provider) }
         store.loaded = true; store.connected = true
         store.agents = Provider.allCases.map { AgentInfo(provider: $0, status: "ready", label: "Fixture", detail: "Fixture") }
+        expect(store.effortOptions(.codex).contains(.max), "Codex Default must offer Max before the catalogue loads")
         store.modelCatalogs = [ModelCatalog(provider: .codex, source: "Fixture", options: [
             ModelOption(id: "model-a", label: "Model A", effortLevels: [.low, .high]),
-            ModelOption(id: "model-b", label: "Model B", effortLevels: [.low, .high])
-        ], effortLevels: [.low, .high])]
+            ModelOption(id: "model-b", label: "Model B", effortLevels: [.low, .high]),
+            ModelOption(id: "model-c", label: "Model C", effortLevels: [.low, .high, .max, .ultra])
+        ], effortLevels: [.low, .medium, .high, .xhigh, .max])]
+        expect(store.effortOptions(.codex).contains(.max), "Codex Default must keep Max after catalogue delivery")
+        expect(!store.effortOptions(.codex, model: "model-a").contains(.max), "Explicit models must retain their supported effort limits")
+        expect(Array(store.effortOptions(.codex, model: "model-c").suffix(2)) == [.max, .ultra], "The picker must expose the full advertised range for a selected model")
         store.resetRoleTeam()
         let original = store.coworkers
         expect(original.map(\.role) == [.architect, .builder, .reviewer], "The role template must create all three roles")
@@ -31,6 +37,10 @@ enum TeamStoreSmoke {
         expect(matchingTeammates("cod", identities: store.chatIdentities).count == 2, "Autocomplete must show both Codex coworkers")
         expect(coworkerMentions("@\(original[2].mention) review", coworkers: original).ids == [original[2].id], "A personal mention must select exactly its coworker")
         expect(coworkerMentions("mail@\(original[1].mention) `@\(original[2].mention)`\n```\n@\(original[0].mention)\n```", coworkers: original).ids.isEmpty, "Code and email must not invoke coworkers")
+        var maxBuilder = original[1]; maxBuilder.effort = .max
+        expect(store.updateCoworker(maxBuilder) == nil && store.coworkers[1].effort == .max, "A coworker using Codex Default must accept and retain Max")
+        maxBuilder.model = "model-a"
+        expect(store.updateCoworker(maxBuilder) != nil, "Max must be rejected for an explicit model that does not advertise it")
         var builder = original[1]; builder.model = "model-a"; builder.effort = .low
         var reviewer = original[2]; reviewer.model = "model-b"; reviewer.effort = .high
         expect(store.updateCoworker(builder) == nil && store.updateCoworker(reviewer) == nil, "The editor must accept separate models and efforts on one connection")
@@ -83,6 +93,23 @@ enum TeamStoreSmoke {
         expect(commandArguments("cargo test --locked") == ["cargo", "test", "--locked"] && commandArguments("printf '%s' '$(touch injected)' \"a b\"") == ["printf", "%s", "$(touch injected)", "a b"], "Check input must parse literal argv without shell expansion")
         expect(commandArguments("cargo 'unfinished") == nil && commandArguments(" ") == nil, "Invalid or empty check commands must stay local")
 
+        // A question can be answered by another identity on the same connection.
+        run = RunRecord(id: run.id, prompt: run.prompt, workspace: run.workspace, workflow: run.workflow,
+                        createdAt: run.createdAt, finishedAt: run.finishedAt, status: .waitingForUser, stages: run.stages, workspaceInfo: run.workspaceInfo)
+        let waitingMail = MailboxDelivery(id: "waiting", at: run.createdAt, from: nil, to: reviewer.id, text: "Original task", kind: "user", state: "waiting_for_user", replyTo: nil, responseId: questionMessage.id)
+        run.conversation = TaskConversation(members: [.claude, .codex], lead: .claude, messages: [questionMessage], sessions: [], coworkers: original, leadId: builder.id, mailbox: [waitingMail])
+        store.runs = [run.summary]; store.continueChat(run)
+        expect(store.questionTeammates(runID: run.id, message: questionMessage).contains { $0.id == builder.id }
+               && !store.questionTeammates(runID: run.id, message: questionMessage).contains { $0.id == reviewer.id }, "Teammate answers must route by coworker ID and exclude the asker")
+        expect(store.delegateQuestion(runID: run.id, message: questionMessage, coworkerID: reviewer.id) != nil && store.pendingQuestionReplies.isEmpty, "Self-delegation must stay local")
+        let assignment = MailboxDelivery(id: "answer-delivery", at: run.createdAt, from: reviewer.id, to: builder.id, text: "Answer the questions", kind: "question_answer", state: "delivered", replyTo: waitingMail.id, responseId: "peer-response", questionTarget: QuestionTarget(messageId: questionMessage.id, requestId: question.id))
+        run.conversation?.mailbox?.append(assignment)
+        store.runs = [run.summary]; store.continueChat(run)
+        expect(store.questionDelegate(runID: run.id, message: questionMessage)?.to == builder.id && !store.canAnswerQuestion(runID: run.id, message: questionMessage), "In-flight delegation must show its owner and prevent competing human answers")
+        let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let attributedQuestion = try decoder.decode(AgentQuestionRequest.self, from: Data("{\"id\":\"question\",\"questions\":[],\"answers\":[],\"answered_by\":\"\(builder.id)\"}".utf8))
+        expect(attributedQuestion.answeredBy == builder.id, "Answered cards must retain the answering coworker's identity")
+
         // Decode actual engine output as well as constructed native records.
         if let path = CommandLine.arguments.dropFirst().first(where: { $0.hasSuffix(".json") }) {
             let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
@@ -98,12 +125,13 @@ enum TeamStoreSmoke {
                     record.conversation = TaskConversation(members: chat.members, lead: chat.lead, messages: Array(chat.messages.suffix(2)), sessions: chat.sessions, names: chat.names, models: chat.models, efforts: chat.efforts, coworkers: chat.coworkers, leadId: chat.leadId, mailbox: chat.mailbox)
                     store.continueChat(record); store.inspectorTab = name == "changes" ? "changes" : "team"
                     try render(store, name: name)
+                    if name == "question" && CommandLine.arguments.contains("--native-preview") { try renderNativeQuestion(store) }
                 }
                 store.newTask(); store.resetRoleTeam()
                 try render(store, name: "new-team")
             }
         }
-        print("Swift team store passed: role templates, duplicate connections, fresh identities, model/effort/rename scoping, autocomplete, project grouping, Inbox navigation and literal check arguments.")
+        print("Swift team store passed: scoped teammate question choices, answer attribution, duplicate sessions, role templates, autocomplete, Inbox navigation and literal check arguments.")
     }
     @MainActor private static func render(_ store: EngineStore, name: String) throws {
         let renderer = ImageRenderer(content: LayoutPreview(width: 1440).environmentObject(store).environment(\.colorScheme, .dark).tint(Theme.accent).frame(width: 1440, height: 940))
@@ -111,6 +139,26 @@ enum TeamStoreSmoke {
         guard let image = renderer.cgImage, let data = NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:]) else { fatalError("Could not render \(name)") }
         let path = "target/team-\(name)-preview.png"
         try data.write(to: URL(fileURLWithPath: path)); print("Rendered \(path)")
+    }
+    @MainActor private static func renderNativeQuestion(_ store: EngineStore) throws {
+        // Native menus and text fields are omitted by ImageRenderer. Render our
+        // own hidden fixture window without driving the installed application.
+        store.focusedMessageID = nil
+        let host = NSHostingView(rootView: RootView().environmentObject(store).environment(\.colorScheme, .dark).tint(Theme.accent))
+        host.frame = NSRect(x: 0, y: 0, width: 1440, height: 940)
+        let hiddenWindow = NSWindow(contentRect: host.frame, styleMask: .borderless, backing: .buffered, defer: false)
+        hiddenWindow.appearance = NSAppearance(named: .darkAqua)
+        hiddenWindow.contentView = host
+        defer { withExtendedLifetime(hiddenWindow) {} }
+        host.layoutSubtreeIfNeeded()
+        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.2))
+        host.layoutSubtreeIfNeeded()
+        expect(!hiddenWindow.isVisible, "The native question fixture must stay off the user's desktop")
+        guard let bitmap = host.bitmapImageRepForCachingDisplay(in: host.bounds) else { fatalError("Missing native question bitmap") }
+        host.cacheDisplay(in: host.bounds, to: bitmap)
+        guard let data = bitmap.representation(using: .png, properties: [:]) else { fatalError("Missing native question image") }
+        try data.write(to: URL(fileURLWithPath: "target/team-question-native-preview.png"))
+        print("Rendered native question controls without a visible window")
     }
     private static func expect(_ condition: @autoclosure () -> Bool, _ message: String) { if !condition() { fatalError(message) } }
 }

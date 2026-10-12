@@ -304,12 +304,13 @@ struct RunRecord: Decodable, Identifiable {
     var conversation: TaskConversation? = nil
     var workspaceInfo: WorkspaceInfo? = nil
     var changes: ChangeSet? = nil
+    var dismissedAttention: [AttentionKey]? = nil
     var projectWorkspace: String { workspaceInfo?.project ?? workspace }
     var summary: RunSummary {
         RunSummary(id: id, title: String(prompt.components(separatedBy: .newlines).first?.prefix(58) ?? "Task"), workspace: projectWorkspace,
                    workflow: workflow, createdAt: createdAt, status: status, providers: conversation?.members ?? stages.map(\.provider),
                    totalTokens: conversation?.messages.reduce(0) { $0 + $1.usage.inputTokens + $1.usage.outputTokens } ?? stages.reduce(0) { $0 + $1.usage.inputTokens + $1.usage.outputTokens }, names: conversation?.names,
-                   coworkers: conversation?.coworkers, attention: conversation?.attentionItems, executionWorkspace: workspace)
+                   coworkers: conversation?.coworkers, attention: conversation?.attentionItems.filter { !(dismissedAttention ?? []).contains($0.key) }, executionWorkspace: workspace)
     }
 }
 
@@ -331,11 +332,13 @@ struct TaskConversation: Decodable {
     var attentionItems: [AttentionItem] {
         var items = messages.flatMap { message -> [AttentionItem] in
             var result: [AttentionItem] = []
-            if let question = message.questionRequest, question.answers == nil { result.append(AttentionItem(id: question.id, messageId: message.id, ownerId: message.authorId, kind: "question", title: question.questions.first?.question ?? "Needs your answer")) }
-            if let approval = message.approvalRequest, approval.decision == nil { result.append(AttentionItem(id: approval.id, messageId: message.id, ownerId: message.authorId, kind: "approval", title: approval.summary)) }
+            if let question = message.questionRequest, question.answers == nil { result.append(AttentionItem(id: question.id, messageId: message.id, ownerId: message.authorId, kind: "question", title: question.questions.first?.question ?? "Needs your answer", revision: question.id)) }
+            if let approval = message.approvalRequest, approval.decision == nil { result.append(AttentionItem(id: approval.id, messageId: message.id, ownerId: message.authorId, kind: "approval", title: approval.summary, revision: approval.id)) }
             return result
         }
-        items += (coworkers ?? []).filter { $0.attention == "ready_for_review" }.map { AttentionItem(id: $0.id, messageId: nil, ownerId: $0.id, kind: "review", title: "\($0.name)'s changes are ready for review") }
+        items += (coworkers ?? []).filter { $0.attention == "ready_for_review" }.map { worker in
+            AttentionItem(id: worker.id, messageId: nil, ownerId: worker.id, kind: "review", title: "\(worker.name)'s changes are ready for review", revision: worker.reviewId ?? messages.last { $0.authorId == worker.id && $0.status == .completed }?.id ?? worker.id)
+        }
         return items
     }
 }
@@ -371,6 +374,7 @@ struct Coworker: Codable, Identifiable, Equatable {
     var effort = Effort.default
     var attention = "idle"
     var waitingFor: String? = nil
+    var reviewId: String? = nil
     var identity: AgentIdentity { AgentIdentity(provider: provider, name: name, mention: mention, coworkerId: id) }
     var command: [String: Any] { ["id": id, "provider": provider.rawValue, "name": name, "mention": mention, "role": role.rawValue, "model": model, "effort": effort.rawValue, "attention": attention, "waiting_for": waitingFor as Any? ?? NSNull()] }
     func statusLabel(in coworkers: [Coworker]) -> String {
@@ -425,6 +429,21 @@ struct AttentionItem: Decodable, Identifiable, Equatable {
     let ownerId: String?
     let kind: String
     let title: String
+    var revision: String? = nil
+    var key: AttentionKey { AttentionKey(id: id, revision: revision ?? id) }
+}
+
+struct AttentionKey: Decodable, Equatable {
+    let id: String
+    let revision: String
+}
+
+struct AttentionDismissal: Decodable {
+    let runId: String
+    let id: String
+    let revision: String
+    var key: AttentionKey { AttentionKey(id: id, revision: revision) }
+    var command: [String: Any] { ["run_id": runId, "id": id, "revision": revision] }
 }
 
 struct AgentApprovalRequest: Decodable, Identifiable, Equatable {
@@ -760,6 +779,7 @@ func agentMentions(_ text: String, identities: [AgentIdentity] = []) -> [Provide
 
 struct EngineEvent: Decodable {
     let type: String
+    var remote: RemoteInfo? = nil
     var runId: String? = nil
     let protocolVersion: Int?
     let settings: Settings?
@@ -773,6 +793,7 @@ struct EngineEvent: Decodable {
     let error: Bool?
     let claudeConfig: ClaudeConfigSnapshot?
     var modelCatalogs: [ModelCatalog]? = nil
+    var items: [AttentionDismissal]? = nil
 }
 
 enum Theme {

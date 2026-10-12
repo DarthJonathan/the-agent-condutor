@@ -4,10 +4,15 @@ mod app;
 mod bridge;
 mod claude_config;
 mod conversation;
+#[cfg(unix)]
+mod host;
+mod inbox;
 mod model;
 mod model_catalog;
 mod providers;
 mod questions;
+#[cfg(unix)]
+mod remote;
 mod runner;
 mod storage;
 mod team;
@@ -21,6 +26,8 @@ fn main() -> eframe::Result {
     let mut capture = None;
     let mut initial_view = app::View::Dashboard;
     let mut bridge_mode = false;
+    let mut connect_mode = false;
+    let mut daemon_mode = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -33,6 +40,9 @@ fn main() -> eframe::Result {
             }
             "--demo" => demo = true,
             "--bridge" => bridge_mode = true,
+            "--connect" => connect_mode = true,
+            "--daemon" => daemon_mode = true,
+            "--supervise" => {}
             "--capture" => {
                 let Some(path) = args.next() else {
                     eprintln!("--capture requires a PNG path");
@@ -53,7 +63,7 @@ fn main() -> eframe::Result {
             }
             "--help" | "-h" => {
                 println!(
-                    "Agent Conductor\n\nUsage: agent-conductor [--data-dir PATH] [--demo] [--capture PNG] [--view workspace|history|connections]\n\n--demo shows sample runs in memory without invoking agents or saving state.\n--capture saves the app's rendered viewport to a PNG, then closes."
+                    "Agent Conductor\n\nUsage: agent-conductor [--data-dir PATH] [--demo] [--capture PNG] [--view workspace|history|connections]\n\n--bridge runs the local JSON engine on stdio.\n--connect attaches stdio to the shared background engine (macOS/Linux).\n--daemon runs the background engine; --supervise waits for an existing host to exit.\n--demo shows sample runs in memory without invoking agents or saving state.\n--capture saves the app's rendered viewport to a PNG, then closes."
                 );
                 return Ok(());
             }
@@ -62,6 +72,23 @@ fn main() -> eframe::Result {
                 std::process::exit(2);
             }
         }
+    }
+    if connect_mode || daemon_mode {
+        #[cfg(unix)]
+        let result = if daemon_mode {
+            host::run(data_dir)
+        } else {
+            host::connect(data_dir)
+        };
+        #[cfg(not(unix))]
+        let result: anyhow::Result<()> = Err(anyhow::anyhow!(
+            "Background remote hosting currently requires macOS or Linux"
+        ));
+        if let Err(error) = result {
+            eprintln!("Background engine stopped: {error:#}");
+            std::process::exit(1);
+        }
+        return Ok(());
     }
     if bridge_mode {
         if let Err(error) = bridge::run(data_dir, demo) {

@@ -20,6 +20,7 @@ struct RootView: View {
         } detail: {
             Group {
                 if store.screen == "connections" { ConnectionsView() }
+                else if store.screen == "remote" { RemoteAccessView() }
                 else if store.screen == "history" { HistoryView() }
                 else if store.screen == "attention" { AttentionInboxView() }
                 else { WorkspaceView() }
@@ -39,6 +40,14 @@ struct RootView: View {
         }
         .navigationSplitViewStyle(.balanced)
         .frame(minWidth: 1050, minHeight: 700)
+        .alert(store.chatToDelete?.workflow == .conversation ? "Delete this chat?" : "Delete this task?",
+               isPresented: Binding(get: { store.chatToDelete != nil }, set: { if !$0 { store.chatToDelete = nil } }),
+               presenting: store.chatToDelete) { run in
+            Button("Cancel", role: .cancel) { store.chatToDelete = nil }
+            Button("Delete", role: .destructive) { store.deleteRun(run) }
+        } message: { run in
+            Text("“\(run.title)” and its saved messages, mailbox and inbox items will be permanently removed from Conductor. Workspace files and agent CLI sessions will be kept.")
+        }
     }
 }
 
@@ -81,7 +90,7 @@ private struct SidebarView: View {
     }
     private var navigationContent: some View {
         VStack(alignment: .leading, spacing: 4) {
-                ForEach([("workspace", "Chat", "bubble.left.and.bubble.right"), ("attention", "Inbox", "tray"), ("history", "Run history", "clock"), ("connections", "Connections", "point.3.connected.trianglepath.dotted")], id: \.0) { screen, label, icon in
+                ForEach([("workspace", "Chat", "bubble.left.and.bubble.right"), ("attention", "Inbox", "tray"), ("history", "Run history", "clock"), ("connections", "Connections", "point.3.connected.trianglepath.dotted"), ("remote", "Remote", "network")], id: \.0) { screen, label, icon in
                     Button { store.screen = screen } label: {
                         HStack(spacing: 10) {
                             Image(systemName: icon).frame(width: 18)
@@ -138,6 +147,12 @@ private struct WorkspaceFolderRow: View {
                             Spacer(minLength: 0)
                         }.padding(.leading, 37).padding(.trailing, 10).padding(.vertical, 7).contentShape(Rectangle())
                     }.buttonStyle(.plain).help(run.title)
+                        .contextMenu {
+                            Button("Open chat") { store.selectRun(run.id) }
+                            Divider()
+                            Button("Delete chat…", role: .destructive) { store.requestDeleteRun(run) }
+                                .disabled(!store.canDeleteRun(run))
+                        }
                 }
             }
         }
@@ -385,7 +400,10 @@ private struct WorkspaceChatView: View {
                         if run.status == .waitingForUser { Label("Waiting for you", systemImage: "questionmark.bubble").font(.system(size: 11)).foregroundStyle(.orange) }
                         if run.status.active {
                             Button("Stop") { store.cancel(run.id) }.tint(.red).disabled(store.cancelling.contains(run.id))
-                        } else { Button { store.export(run.id) } label: { Image(systemName: "square.and.arrow.up") }.help("Export conversation") }
+                        } else {
+                            Button { store.export(run.id) } label: { Image(systemName: "square.and.arrow.up") }.help("Export conversation")
+                            DeleteRunButton(run: run.summary)
+                        }
                     }
                 }
                 Divider()
@@ -411,7 +429,7 @@ private struct WorkspaceChatView: View {
                 Panel(padding: 16) {
                     VStack(alignment: .leading, spacing: 12) {
                         if store.hasPendingQuestions {
-                            Label(store.chatRun?.conversation?.pendingApprovals.isEmpty == false ? "Review the command approval above to continue this chat." : "Answer or skip the questions above to continue this chat.", systemImage: "questionmark.bubble")
+                            Label(store.chatRun?.conversation?.pendingApprovals.isEmpty == false ? "Review the command approval above to continue this chat." : store.questionsAssignedToTeammates ? "Your teammate is answering the pending questions." : "Answer or skip the questions above to continue this chat.", systemImage: "questionmark.bubble")
                                 .font(.system(size: 12)).foregroundStyle(.orange)
                         }
                         ZStack(alignment: .topLeading) {
@@ -457,11 +475,15 @@ private struct ConversationTranscript: View {
                     .background(TranscriptScrollObserver { event in
                         following?.cancel(); following = nil
                         switch event {
-                        case .began: store.setTranscriptScrolling(true); followState.begin()
+                        case .began: followState.begin()
                         case .moved(let nearBottom): followState.moved(nearBottom: nearBottom)
-                        case .ended(let nearBottom): store.setTranscriptScrolling(false); followState.end(nearBottom: nearBottom)
+                        case .ended(let nearBottom): followState.end(nearBottom: nearBottom)
                         }
-                        if followState.canFollow { followBottom(proxy) }
+                        store.setTranscriptReadingHistory(!followState.canFollow)
+                        if followState.canFollow {
+                            if store.focusedMessageID != nil { store.focusedMessageID = nil }
+                            followBottom(proxy)
+                        }
                     }.frame(width: 0, height: 0))
             }
             .overlay(alignment: .bottomTrailing) {
@@ -469,23 +491,32 @@ private struct ConversationTranscript: View {
                     Button {
                         store.focusedMessageID = nil
                         followState.jumpToLatest()
+                        store.setTranscriptReadingHistory(false)
                         followBottom(proxy)
                     } label: { Label("Latest", systemImage: "arrow.down.circle") }
                         .buttonStyle(.bordered).padding(12)
                 }
             }
             .onAppear {
-                if let id = store.focusedMessageID { followState.end(nearBottom: false); proxy.scrollTo(id, anchor: .top) }
-                else { followBottom(proxy) }
+                if let id = store.focusedMessageID {
+                    followState.end(nearBottom: false)
+                    store.setTranscriptReadingHistory(true)
+                    proxy.scrollTo(id, anchor: .top)
+                }
+                else { store.setTranscriptReadingHistory(false); followBottom(proxy) }
             }
             .onChange(of: store.focusedMessageID) { _, id in
-                if let id { following?.cancel(); following = nil; followState.end(nearBottom: false); proxy.scrollTo(id, anchor: .top) }
+                if let id {
+                    following?.cancel(); following = nil; followState.end(nearBottom: false)
+                    store.setTranscriptReadingHistory(true)
+                    proxy.scrollTo(id, anchor: .top)
+                }
             }
             .onChange(of: run.conversation?.messages.count) { _, _ in followBottom(proxy) }
             .onChange(of: run.conversation?.messages.last?.text.count) { _, _ in if run.status.active { followBottom(proxy) } }
             .onChange(of: run.conversation?.messages.last?.reasoning?.count) { _, _ in if run.status.active { followBottom(proxy) } }
             .onChange(of: run.status) { _, _ in followBottom(proxy) }
-            .onDisappear { following?.cancel(); following = nil; store.setTranscriptScrolling(false) }
+            .onDisappear { following?.cancel(); following = nil; store.setTranscriptReadingHistory(false) }
         }
     }
     // Coalesce requests until layout settles. A user scroll takes priority and
@@ -668,6 +699,15 @@ private struct AgentQuestionCard: View {
                 Spacer()
                 if request.answers == nil { Text("\(request.questions.count) question\(request.questions.count == 1 ? "" : "s")").font(.system(size: 11)).foregroundStyle(.secondary) }
             }.foregroundStyle(request.answers == nil ? Color.orange : Theme.accent)
+            if request.answers == nil && assignment == nil {
+                Menu {
+                    ForEach(teammates) { worker in
+                        Button("\(worker.name) · \(worker.provider.name)") { error = store.delegateQuestion(runID: runID, message: message, coworkerID: worker.id) }
+                    }
+                } label: { Label("Ask a teammate", systemImage: "person.2") }
+                    .disabled(teammates.isEmpty).fixedSize()
+                    .help("Choose another coworker to answer these questions in their own session")
+            }
             ForEach(request.questions) { question in
                 if let answer = request.answers?.first(where: { $0.questionId == question.id }) {
                     VStack(alignment: .leading, spacing: 7) {
@@ -693,21 +733,12 @@ private struct AgentQuestionCard: View {
                         Text(assignment.state == "waiting_for_user" ? "\(teammateName) needs input before answering. Open their question or approval below." : assignment.state == "paused" ? "\(teammateName)'s answer is queued for continuation." : "Waiting for \(teammateName). Their answers will resume \(agentName)'s session.")
                             .font(.system(size: 12)).foregroundStyle(.secondary)
                         Spacer(minLength: 8)
+                        if assignment.state == "paused" { Button("Continue") { store.continueMailbox() }.disabled(store.busy || store.demo) }
                         if assignment.cancellable { Button("Cancel request") { store.cancelDelivery(assignment) }.disabled(store.demo) }
                     }
                 } else {
                     HStack(spacing: 12) {
                         Button("Skip questions") { submit(skipAll: true) }.buttonStyle(.plain).foregroundStyle(.secondary).disabled(!canAnswer)
-                        Spacer()
-                        Menu {
-                            ForEach(teammates) { worker in
-                                Button("\(worker.name) · \(worker.provider.name)") { error = store.delegateQuestion(runID: runID, message: message, coworkerID: worker.id) }
-                            }
-                        } label: { Label("Ask a teammate", systemImage: "person.2") }
-                            .disabled(teammates.isEmpty).fixedSize()
-                            .help("Choose another coworker to answer these questions in their own session")
-                    }
-                    HStack(spacing: 12) {
                         Spacer()
                         if pending { ProgressView().controlSize(.small) }
                         Button(pending ? "Sending…" : "Send answers to \(agentName)") { submit(skipAll: false) }
@@ -1139,6 +1170,18 @@ private struct EmptyActivity: View {
     }
 }
 
+private struct DeleteRunButton: View {
+    @EnvironmentObject private var store: EngineStore
+    let run: RunSummary
+    var body: some View {
+        Button(role: .destructive) { store.requestDeleteRun(run) } label: {
+            Image(systemName: "trash")
+        }.disabled(!store.canDeleteRun(run))
+            .help(run.status.active ? "Stop this chat before deleting it" : "Delete \(run.workflow == .conversation ? "chat" : "task")…")
+            .accessibilityLabel("Delete \(run.workflow == .conversation ? "chat" : "task") \(run.title)")
+    }
+}
+
 private struct HistoryView: View {
     @EnvironmentObject private var store: EngineStore
     @State private var search = ""
@@ -1172,6 +1215,7 @@ private struct HistoryView: View {
                     ScrollView {
                         LazyVStack(spacing: 7) {
                             ForEach(filtered) { run in
+                                HStack(spacing: 8) {
                                 Button { store.selectRun(run.id) } label: {
                                     HStack(spacing: 12) {
                                         Circle().fill(run.status.color).frame(width: 6, height: 6)
@@ -1186,9 +1230,17 @@ private struct HistoryView: View {
                                             Label("Open chat", systemImage: "bubble.left").font(.system(size: 12)).foregroundStyle(Theme.accent)
                                         }
                                         Text(run.status.label).font(.system(size: 11)).foregroundStyle(run.status.color)
-                                    }.padding(15).background(store.selectedRunID == run.id ? Theme.accent.opacity(0.08) : Theme.panel, in: RoundedRectangle(cornerRadius: 9))
-                                        .overlay(RoundedRectangle(cornerRadius: 9).strokeBorder(store.selectedRunID == run.id ? Theme.accent.opacity(0.25) : Theme.border))
+                                    }.contentShape(Rectangle())
                                 }.buttonStyle(.plain)
+                                DeleteRunButton(run: run)
+                                }.padding(15).background(store.selectedRunID == run.id ? Theme.accent.opacity(0.08) : Theme.panel, in: RoundedRectangle(cornerRadius: 9))
+                                    .overlay(RoundedRectangle(cornerRadius: 9).strokeBorder(store.selectedRunID == run.id ? Theme.accent.opacity(0.25) : Theme.border))
+                                    .contextMenu {
+                                        Button("Open \(run.workflow == .conversation ? "chat" : "task")") { store.selectRun(run.id) }
+                                        Divider()
+                                        Button("Delete \(run.workflow == .conversation ? "chat" : "task")…", role: .destructive) { store.requestDeleteRun(run) }
+                                            .disabled(!store.canDeleteRun(run))
+                                    }
                             }
                             if filtered.isEmpty { Text("No tasks match your search.").foregroundStyle(.secondary).padding(20) }
                         }
@@ -1221,6 +1273,7 @@ private struct RunDetailView: View {
                         Button("Use task again") { store.reuse(run) }.controlSize(.small)
                         Button { store.startChat(from: run) } label: { Label("Start chat", systemImage: "bubble.left") }
                             .buttonStyle(.borderedProminent).help("Start a conversation with this task's prompt and agents")
+                        DeleteRunButton(run: run.summary)
                     }
                 }
                 VStack(alignment: .leading, spacing: 6) {
@@ -1688,7 +1741,7 @@ private struct MailboxInspectorView: View {
     }
 }
 
-private struct AttentionInboxView: View {
+struct AttentionInboxView: View {
     @EnvironmentObject private var store: EngineStore
     var scrollable = true
     private var tasks: [RunSummary] { store.runs.filter { !($0.attention ?? []).isEmpty } }
@@ -1697,7 +1750,13 @@ private struct AttentionInboxView: View {
     }
     private var content: some View {
             VStack(alignment: .leading, spacing: 22) {
-                PageHeading(title: "Inbox", subtitle: "Questions, approvals and changes that need your attention.")
+                HStack(alignment: .top, spacing: 16) {
+                    PageHeading(title: "Inbox", subtitle: "Questions, approvals and changes that need your attention.")
+                    Spacer(minLength: 0)
+                    Button(action: store.clearInbox) { Label(store.clearingInbox ? "Clearing…" : "Clear inbox", systemImage: "checkmark.circle") }
+                        .disabled(!store.canClearInbox)
+                        .help("Dismiss the current inbox items. Pending questions and approvals stay available in their chats.")
+                }
                 if tasks.isEmpty { Panel { Label("You're caught up.", systemImage: "checkmark.circle").foregroundStyle(.secondary).frame(maxWidth: .infinity).padding(40) } }
                 ForEach(tasks) { run in
                     ForEach(run.attention ?? []) { item in
@@ -1709,6 +1768,10 @@ private struct AttentionInboxView: View {
                                     Text("\(run.coworkers?.first { $0.id == item.ownerId }?.name ?? "Coworker") · \(run.title) · \(folderName(run.workspace))").font(.system(size: 12)).foregroundStyle(.secondary)
                                 }.frame(maxWidth: .infinity, alignment: .leading)
                                 Button(item.kind == "approval" ? "Review command" : item.kind == "review" ? "Review changes" : "Answer question") { store.openAttention(run: run, item: item) }
+                                Button { store.dismissAttention(run: run, item: item) } label: { Image(systemName: "xmark") }
+                                    .buttonStyle(.plain).foregroundStyle(.secondary)
+                                    .padding(4).disabled(!store.canClearInbox)
+                                    .help("Dismiss from inbox").accessibilityLabel("Dismiss \(item.title) from inbox")
                             }
                         }
                     }

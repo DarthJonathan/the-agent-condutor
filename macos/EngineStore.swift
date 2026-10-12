@@ -2,9 +2,11 @@ import AppKit
 import Foundation
 import SwiftUI
 
-// Coalesce visual progress between frames and hold it during a live scroll.
+// Coalesce visual progress before Markdown parsing, and hold it while reading
+// older messages as well as during a live scroll.
 // Control transitions stay immediate; the engine keeps working independently.
-final class EventDelivery {
+// Scheduler state is lock protected; rendering is serial; receive is main-only.
+final class EventDelivery: @unchecked Sendable {
     private struct Status: Equatable { let id: String; let value: String }
     private struct MessageControl: Equatable {
         let id: String; let kind: String; let status: String
@@ -27,35 +29,53 @@ final class EventDelivery {
             mailbox = (run.conversation?.mailbox ?? []).map { Status(id: $0.id, value: $0.state) }
         }
     }
-    private struct Snapshot {
+    // Engine models and Markdown blocks are value snapshots. A copied snapshot
+    // is prepared on one queue, then transferred to the main queue without mutation.
+    private struct Snapshot: @unchecked Sendable {
         let event: EngineEvent
-        let rendered: [Provider: [ResponseBlock]]
-        let chat: [String: [ResponseBlock]]
+        var rendered: [Provider: [ResponseBlock]]
+        var chat: [String: [ResponseBlock]]
+        var needsRendering: Bool
         let control: ControlState?
         var progress: Bool
     }
     private let lock = NSLock()
     private var pending: [Snapshot] = []
     private var controls: [String: ControlState] = [:]
+    private var deletedRuns = Set<String>()
     private var scheduled = false
     private var delayed = false
+    private var preparing = false
     private var generation = 0
     private var scrolling = false
     private var lastDelivery: TimeInterval = 0
+    private let renderingQueue = DispatchQueue(label: "dev.agentconductor.render", qos: .userInitiated)
+    private let render: ((EngineEvent) -> RenderedEvent)?
     private let receive: @MainActor (EngineEvent, [Provider: [ResponseBlock]], [String: [ResponseBlock]]) -> Void
-    init(receive: @escaping @MainActor (EngineEvent, [Provider: [ResponseBlock]], [String: [ResponseBlock]]) -> Void) {
+    init(render: ((EngineEvent) -> RenderedEvent)? = nil, receive: @escaping @MainActor (EngineEvent, [Provider: [ResponseBlock]], [String: [ResponseBlock]]) -> Void) {
+        self.render = render
         self.receive = receive
     }
     func enqueue(_ event: EngineEvent, rendered: [Provider: [ResponseBlock]], chat: [String: [ResponseBlock]]) {
+        enqueue(event, rendered: rendered, chat: chat, needsRendering: false)
+    }
+    func enqueue(_ event: EngineEvent) { enqueue(event, rendered: [:], chat: [:], needsRendering: true) }
+    private func enqueue(_ event: EngineEvent, rendered: [Provider: [ResponseBlock]], chat: [String: [ResponseBlock]], needsRendering: Bool) {
         lock.lock()
         defer { lock.unlock() }
+        if event.type == "run_deleted", let id = event.runId {
+            deletedRuns.insert(id)
+            controls.removeValue(forKey: id)
+            pending.removeAll { $0.event.run?.id == id }
+        }
+        if let id = event.run?.id, deletedRuns.contains(id) { return }
         let control = event.run.map(ControlState.init)
         let progress = event.type == "run_updated" && event.run?.status == .running && event.run.map { controls[$0.id] == control } == true
         if let run = event.run, let control {
             controls[run.id] = control
             if controls.count > 128, let evicted = controls.keys.first(where: { $0 != run.id }) { controls.removeValue(forKey: evicted) }
         }
-        var snapshot = Snapshot(event: event, rendered: rendered, chat: chat, control: control, progress: progress)
+        var snapshot = Snapshot(event: event, rendered: rendered, chat: chat, needsRendering: needsRendering, control: control, progress: progress)
         if event.type == "run_updated", event.run?.status == .running,
            let last = pending.last, last.event.type == "run_updated", last.event.run?.status == .running,
            last.event.run?.id == event.run?.id, last.control == control {
@@ -65,6 +85,7 @@ final class EventDelivery {
         } else if progress, let index = pending.indices.reversed().prefix(while: { pending[$0].progress }).first(where: { pending[$0].event.run?.id == event.run?.id }) {
             pending[index] = snapshot
         } else { pending.append(snapshot) }
+        guard !preparing else { return }
         if pending.contains(where: { !$0.progress }) {
             if !scheduled || delayed { scheduleLocked(after: 0) }
         } else if !scheduled && !scrolling {
@@ -78,7 +99,7 @@ final class EventDelivery {
         scrolling = active
         if active && pending.allSatisfy(\.progress) {
             generation += 1; scheduled = false; delayed = false
-        } else if !active && !pending.isEmpty { scheduleLocked(after: 0) }
+        } else if !active && !pending.isEmpty && !preparing { scheduleLocked(after: 0) }
     }
     private func scheduleLocked(after delay: TimeInterval) {
         scheduled = true; delayed = delay > 0; generation += 1
@@ -89,16 +110,108 @@ final class EventDelivery {
         lock.lock()
         guard generation == current else { lock.unlock(); return }
         scheduled = false; delayed = false
-        guard !scrolling || pending.contains(where: { !$0.progress }) else { lock.unlock(); return }
+        guard !preparing, !scrolling || pending.contains(where: { !$0.progress }) else { lock.unlock(); return }
         let snapshots = pending
         pending.removeAll(keepingCapacity: true)
-        lastDelivery = ProcessInfo.processInfo.systemUptime
+        let needsRendering = snapshots.contains(where: \.needsRendering) && render != nil
+        preparing = needsRendering
         lock.unlock()
-        for snapshot in snapshots { receive(snapshot.event, snapshot.rendered, snapshot.chat) }
+        let urgent = snapshots.contains { !$0.progress }
+        if needsRendering, let render {
+            // Only accepted frames reach the parser. A burst of tokens or an
+            // offscreen live reply does not repeatedly parse a long document.
+            renderingQueue.async { [self] in
+                let prepared = snapshots.map { snapshot -> Snapshot in
+                    var snapshot = snapshot
+                    if snapshot.needsRendering {
+                        let content = render(snapshot.event)
+                        snapshot.rendered = content.responses; snapshot.chat = content.chat
+                        snapshot.needsRendering = false
+                    }
+                    return snapshot
+                }
+                DispatchQueue.main.async { [self] in finish(prepared, urgent: urgent, prepared: true) }
+            }
+        } else { finish(snapshots, urgent: urgent) }
+    }
+    @MainActor private func finish(_ snapshots: [Snapshot], urgent: Bool, prepared: Bool = false) {
+        lock.lock()
+        if prepared { preparing = false }
+        var delivered: [Snapshot] = []
+        for snapshot in snapshots {
+            if let id = snapshot.event.run?.id, deletedRuns.contains(id) { continue }
+            if !urgent && snapshot.progress, let id = snapshot.event.run?.id {
+                // Scrolling can start while background parsing is in flight.
+                // Never restore stale progress after a newer control state.
+                guard controls[id] == snapshot.control else { continue }
+                if pending.contains(where: { $0.event.run?.id == id }) { continue }
+                if scrolling { pending.insert(snapshot, at: 0); continue }
+            }
+            delivered.append(snapshot)
+        }
+        if !delivered.isEmpty { lastDelivery = ProcessInfo.processInfo.systemUptime }
+        if !pending.isEmpty && !scheduled && !preparing {
+            if pending.contains(where: { !$0.progress }) { scheduleLocked(after: 0) }
+            else if !scrolling { scheduleLocked(after: max(0, 1.0 / 15 - (ProcessInfo.processInfo.systemUptime - lastDelivery))) }
+        }
+        lock.unlock()
+        for snapshot in delivered { receive(snapshot.event, snapshot.rendered, snapshot.chat) }
     }
 }
 
-// Pipe framing and decoding stay off the main queue, including long agent responses.
+struct RenderedEvent {
+    var responses: [Provider: [ResponseBlock]] = [:]
+    var chat: [String: [ResponseBlock]] = [:]
+}
+
+// Used only on EventDelivery's serial rendering queue. Keep separate caches for
+// interleaved chats so another task's update cannot reparse completed replies.
+final class EventRenderer {
+    private struct Cache {
+        var responses: [Provider: (String, [ResponseBlock])] = [:]
+        var chat: [String: (String, [ResponseBlock])] = [:]
+        var bytes: Int { responses.values.reduce(0) { $0 + $1.0.utf8.count } + chat.values.reduce(0) { $0 + $1.0.utf8.count } }
+    }
+    private var caches: [String: Cache] = [:]
+    private var recent: [String] = []
+    private(set) var parsedDocuments = 0
+    func render(_ event: EngineEvent) -> RenderedEvent {
+        if event.type == "run_deleted", let id = event.runId {
+            caches.removeValue(forKey: id); recent.removeAll { $0 == id }
+        }
+        guard let run = event.run else { return RenderedEvent() }
+        var cache = caches[run.id] ?? Cache()
+        var result = RenderedEvent()
+        let providers = Set(run.stages.map(\.provider))
+        cache.responses = cache.responses.filter { providers.contains($0.key) }
+        for stage in run.stages {
+            if cache.responses[stage.provider]?.0 != stage.output {
+                cache.responses[stage.provider] = (stage.output, responseBlocks(stage.output)); parsedDocuments += 1
+            }
+            result.responses[stage.provider] = cache.responses[stage.provider]?.1 ?? []
+        }
+        let messages = run.conversation?.messages ?? []
+        let ids = Set(messages.map(\.id))
+        cache.chat = cache.chat.filter { ids.contains($0.key) }
+        for message in messages {
+            if cache.chat[message.id]?.0 != message.text {
+                cache.chat[message.id] = (message.text, responseBlocks(message.text)); parsedDocuments += 1
+            }
+            result.chat[message.id] = cache.chat[message.id]?.1 ?? []
+        }
+        recent.removeAll { $0 == run.id }; recent.append(run.id)
+        caches[run.id] = cache
+        // A few large conversations should not keep every old Markdown tree
+        // alive. Retain the current run; evict older entries by size as well as count.
+        while recent.count > 1 && (recent.count > 8 || caches.values.reduce(0, { $0 + $1.bytes }) > 8 * 1024 * 1024) {
+            caches.removeValue(forKey: recent.removeFirst())
+        }
+        return result
+    }
+}
+
+// Pipe framing and decoding stay off the main queue. Markdown waits for the
+// delivery boundary, after pacing and reading-history backpressure.
 private final class EventReader {
     private let queue = DispatchQueue(label: "dev.agentconductor.events", qos: .userInitiated)
     private var buffer = Data()
@@ -107,11 +220,9 @@ private final class EventReader {
         value.keyDecodingStrategy = .convertFromSnakeCase
         return value
     }()
-    private var cache: [Provider: (String, [ResponseBlock])] = [:]
-    private var chatCache: [String: (String, [ResponseBlock])] = [:]
-    let receive: (EngineEvent, [Provider: [ResponseBlock]], [String: [ResponseBlock]]) -> Void
+    let receive: (EngineEvent) -> Void
     let fail: (String) -> Void
-    init(receive: @escaping (EngineEvent, [Provider: [ResponseBlock]], [String: [ResponseBlock]]) -> Void, fail: @escaping (String) -> Void) {
+    init(receive: @escaping (EngineEvent) -> Void, fail: @escaping (String) -> Void) {
         self.receive = receive
         self.fail = fail
     }
@@ -122,22 +233,7 @@ private final class EventReader {
                 let line = Data(buffer[..<end])
                 buffer.removeSubrange(...end)
                 do {
-                    let event = try decoder.decode(EngineEvent.self, from: line)
-                    var rendered: [Provider: [ResponseBlock]] = [:]
-                    for stage in event.run?.stages ?? [] {
-                        if cache[stage.provider]?.0 != stage.output { cache[stage.provider] = (stage.output, responseBlocks(stage.output)) }
-                        rendered[stage.provider] = cache[stage.provider]?.1 ?? []
-                    }
-                    var renderedChat: [String: [ResponseBlock]] = [:]
-                    if let chat = event.run?.conversation {
-                        let ids = Set(chat.messages.map(\.id))
-                        chatCache = chatCache.filter { ids.contains($0.key) }
-                        for message in chat.messages {
-                            if chatCache[message.id]?.0 != message.text { chatCache[message.id] = (message.text, responseBlocks(message.text)) }
-                            renderedChat[message.id] = chatCache[message.id]?.1 ?? []
-                        }
-                    }
-                    receive(event, rendered, renderedChat)
+                    receive(try decoder.decode(EngineEvent.self, from: line))
                 }
                 catch { fail("Could not read the agent engine response: \(error.localizedDescription)") }
             }
@@ -270,6 +366,9 @@ extension EngineStore {
 
 @MainActor
 final class EngineStore: ObservableObject {
+    let remote = RemoteAccessStore()
+    func configureRemote(_ config: RemoteConfiguration, token: String) { send(["type": "remote_configure", "config": config.command, "token": token]) }
+    func disableRemote() { send(["type": "remote_disable"]) }
     @Published var settings = Settings() {
         didSet {
             if !applying {
@@ -318,12 +417,16 @@ final class EngineStore: ObservableObject {
     @Published var claudeConfig: ClaudeConfigSnapshot?
     @Published var cancelling = Set<String>()
     @Published private(set) var pendingQuestionReplies = Set<String>()
+    @Published var chatToDelete: RunSummary?
+    @Published private(set) var deletingRuns = Set<String>()
+    @Published private(set) var clearingInbox = false
     let options: LaunchOptions
     private var process: Process?
     private var input: FileHandle?
     private var output: FileHandle?
     private var reader: EventReader?
     private var delivery: EventDelivery?
+    private(set) var transcriptReadingHistory = false
     private let writer = DispatchQueue(label: "dev.agentconductor.commands")
     private var applying = false
     private var saving: Task<Void, Never>?
@@ -342,6 +445,8 @@ final class EngineStore: ObservableObject {
     private var pendingChat = false
     private var submittedChatPrompt = ""
     private var coworkerDrafts: [String: [Coworker]] = [:]
+    private var deletedRunIDs = Set<String>()
+    private var pendingInboxBatches = 0
 
     init(options: LaunchOptions) {
         self.options = options
@@ -349,7 +454,10 @@ final class EngineStore: ObservableObject {
         newAgentNames = AgentIdentity.suggestedTeam(members: Provider.allCases)
     }
 
-    func setTranscriptScrolling(_ active: Bool) { delivery?.setScrolling(active) }
+    func setTranscriptReadingHistory(_ active: Bool) {
+        transcriptReadingHistory = active
+        delivery?.setScrolling(active)
+    }
 
     var busy: Bool { runs.contains { $0.status.active } }
     var workspaceRuns: [RunSummary] { runs.filter { $0.workspace == settings.workspace } }
@@ -395,7 +503,7 @@ final class EngineStore: ObservableObject {
             return provider == .deepseek && settings.deepseekMode == .directApi ? [.none, .low, .high, .max] : [.low, .high, .max]
         }
         if provider == .antigravity { return [.low, .medium, .high] }
-        if provider == .codex { return [.low, .medium, .high, .xhigh] }
+        if provider == .codex { return [.low, .medium, .high, .xhigh, .max] }
         return [.low, .medium, .high, .xhigh, .max]
     }
     func effortNote(_ provider: Provider) -> String {
@@ -489,6 +597,10 @@ final class EngineStore: ObservableObject {
     var leadName: String { usesCoworkerTeams ? effectiveCoworker?.name ?? "your coworker" : displayName(effectiveLead) }
     var chatting: Bool { settings.workflow == .conversation || chatRun != nil }
     var hasPendingQuestions: Bool { !(chatRun?.conversation?.pendingQuestions.isEmpty ?? true) || !(chatRun?.conversation?.pendingApprovals.isEmpty ?? true) }
+    var questionsAssignedToTeammates: Bool {
+        guard let run = chatRun, let chat = run.conversation, !chat.pendingQuestions.isEmpty, chat.pendingApprovals.isEmpty else { return false }
+        return chat.pendingQuestions.allSatisfy { questionDelegate(runID: run.id, message: $0) != nil }
+    }
     var canRun: Bool {
         if usesCoworkerTeams && chatting {
             let query = forcedRecipientID.map { (ids: [$0], ambiguous: String?.none) } ?? coworkerMentions(prompt, coworkers: coworkers)
@@ -525,17 +637,19 @@ final class EngineStore: ObservableObject {
         let outgoing = Pipe()
         let errors = Pipe()
         child.executableURL = executable
-        child.arguments = ["--bridge"] + (options.demo ? ["--demo"] : [])
+        child.arguments = [options.demo || options.smoke ? "--bridge" : "--connect"] + (options.demo ? ["--demo"] : [])
         if let dataDir = options.dataDir { child.arguments! += ["--data-dir", dataDir] }
         child.standardInput = incoming
         child.standardOutput = outgoing
         child.standardError = errors
         input = incoming.fileHandleForWriting
         output = outgoing.fileHandleForReading
-        let delivery = EventDelivery { [weak self] event, rendered, chat in self?.apply(event, rendered: rendered, chat: chat) }
+        let renderer = EventRenderer()
+        let delivery = EventDelivery(render: renderer.render) { [weak self] event, rendered, chat in self?.apply(event, rendered: rendered, chat: chat) }
         self.delivery = delivery
-        reader = EventReader(receive: { event, rendered, chat in
-            delivery.enqueue(event, rendered: rendered, chat: chat)
+        delivery.setScrolling(transcriptReadingHistory)
+        reader = EventReader(receive: { event in
+            delivery.enqueue(event)
         }, fail: { [weak self] message in
             DispatchQueue.main.async { self?.showNotice(message, error: true) }
         })
@@ -553,6 +667,7 @@ final class EngineStore: ObservableObject {
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.connected = false
+                self.clearingInbox = false; self.pendingInboxBatches = 0; self.deletingRuns.removeAll()
                 if !self.closing { self.showNotice("The agent engine stopped. Reopen the app to reconnect.", error: true) }
             }
         }
@@ -566,12 +681,13 @@ final class EngineStore: ObservableObject {
         }
     }
 
-    private func apply(_ event: EngineEvent, rendered: [Provider: [ResponseBlock]], chat: [String: [ResponseBlock]]) {
+    func apply(_ event: EngineEvent, rendered: [Provider: [ResponseBlock]], chat: [String: [ResponseBlock]]) {
         if options.smoke {
             print("SwiftUI event: \(event.type), run status: \(event.run?.status.rawValue ?? "none")")
             fflush(stdout)
         }
         switch event.type {
+        case "remote_state": remote.receive(event.remote)
         case "state":
             guard event.protocolVersion == 1, let settings = event.settings else {
                 showNotice("This interface and engine use incompatible versions.", error: true)
@@ -605,6 +721,7 @@ final class EngineStore: ObservableObject {
             }
         case "run_updated", "run_detail":
             guard let run = event.run else { return }
+            guard !deletedRunIDs.contains(run.id) else { return }
             for message in run.conversation?.messages ?? [] {
                 if let request = message.questionRequest, pendingQuestionReplies.contains(request.id),
                    request.answers != nil || run.conversation?.mailbox?.contains(where: { $0.questionTarget?.requestId == request.id }) == true || !run.status.active {
@@ -752,8 +869,41 @@ final class EngineStore: ObservableObject {
         case "team_queued":
             pendingChat = false
             if prompt.trimmingCharacters(in: .whitespacesAndNewlines) == submittedChatPrompt { prompt = "" }
+        case "attention_dismissed":
+            pendingInboxBatches = max(0, pendingInboxBatches - 1)
+            clearingInbox = pendingInboxBatches > 0
+            for dismissal in event.items ?? [] {
+                if let index = runs.firstIndex(where: { $0.id == dismissal.runId }) {
+                    runs[index].attention?.removeAll { $0.key == dismissal.key }
+                }
+                if var run = selectedRun, run.id == dismissal.runId {
+                    var keys = run.dismissedAttention ?? []
+                    if !keys.contains(dismissal.key) { keys.append(dismissal.key) }
+                    run.dismissedAttention = keys
+                    selectedRun = run
+                }
+            }
+        case "run_deleted":
+            guard let id = event.runId else { return }
+            deletedRunIDs.insert(id)
+            deletingRuns.remove(id); cancelling.remove(id)
+            runs.removeAll { $0.id == id }
+            if chatToDelete?.id == id { chatToDelete = nil }
+            if shareTaskID == id { shareTaskID = ""; isolationMode = "shared" }
+            if selectedRunID == id || selectedRun?.id == id {
+                let currentScreen = screen
+                for message in selectedRun?.conversation?.messages ?? [] {
+                    if let request = message.questionRequest { pendingQuestionReplies.remove(request.id) }
+                    if let request = message.approvalRequest { pendingQuestionReplies.remove(request.id) }
+                }
+                newTask()
+                selectedProvider = nil; renderedResponses = [:]
+                setTranscriptReadingHistory(false)
+                if currentScreen != "workspace" { screen = currentScreen }
+            }
+            showNotice("Chat deleted. Workspace files were kept.", error: false)
         case "notice":
-            if event.error == true { pendingChat = false; pendingQuestionReplies.removeAll() }
+            if event.error == true { pendingChat = false; pendingQuestionReplies.removeAll(); deletingRuns.removeAll(); clearingInbox = false; pendingInboxBatches = 0 }
             showNotice(event.message ?? "Engine notice", error: event.error ?? false)
         default: break
         }
@@ -885,6 +1035,41 @@ final class EngineStore: ObservableObject {
     func cancel(_ id: String) {
         cancelling.insert(id)
         send(["type": "cancel", "run_id": id])
+    }
+    var canClearInbox: Bool { loaded && connected && !demo && !persistenceBlocked && !clearingInbox && attentionCount > 0 }
+    func dismissAttention(run: RunSummary, item: AttentionItem) {
+        guard canClearInbox else { return }
+        dismissAttention([AttentionDismissal(runId: run.id, id: item.id, revision: item.key.revision)])
+    }
+    func clearInbox() {
+        guard canClearInbox else { return }
+        dismissAttention(runs.flatMap { run in
+            (run.attention ?? []).map { AttentionDismissal(runId: run.id, id: $0.id, revision: $0.key.revision) }
+        })
+    }
+    private func dismissAttention(_ items: [AttentionDismissal]) {
+        guard !items.isEmpty else { return }
+        clearingInbox = true
+        // Keep a large history beneath the bridge's 1 MiB request limit.
+        pendingInboxBatches = (items.count + 499) / 500
+        for start in stride(from: 0, to: items.count, by: 500) {
+            send(["type": "dismiss_attention", "items": items[start..<min(start + 500, items.count)].map(\.command)])
+        }
+    }
+    func canDeleteRun(_ run: RunSummary) -> Bool {
+        loaded && connected && !demo && !persistenceBlocked && !run.status.active
+            && !deletingRuns.contains(run.id) && !pendingChat && pendingQuestionReplies.isEmpty
+    }
+    func requestDeleteRun(_ run: RunSummary) { if canDeleteRun(run) { chatToDelete = run } }
+    func deleteRun(_ run: RunSummary) {
+        guard let current = runs.first(where: { $0.id == run.id }) else { return }
+        guard canDeleteRun(current) else {
+            showNotice("Wait for this chat's agents to stop before deleting it.", error: true)
+            return
+        }
+        chatToDelete = nil
+        deletingRuns.insert(run.id)
+        send(["type": "delete_run", "run_id": run.id])
     }
     func selectRun(_ id: String, navigate: Bool = true) {
         if selectedRunID != id { teamDiscussion = false }

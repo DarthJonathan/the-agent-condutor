@@ -136,6 +136,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NSM
 @main
 enum ConductorApp {
     @MainActor static func main() {
+        if let index = CommandLine.arguments.firstIndex(of: "--remote-credential"), CommandLine.arguments.indices.contains(index + 1) {
+            if let token = RemoteCredential.get(CommandLine.arguments[index + 1]) { print(token); exit(0) }
+            exit(1)
+        }
         let application = NSApplication.shared
         let delegate = AppDelegate(options: LaunchOptions())
         application.setActivationPolicy(.regular)

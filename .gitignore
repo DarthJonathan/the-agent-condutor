@@ -2,5 +2,9 @@
 /dist/
 /.conductor/
 *.log
+__pycache__/
 .DS_Store
 .env
+/frontend/node_modules/
+/frontend/.svelte-kit/
+/frontend/build/

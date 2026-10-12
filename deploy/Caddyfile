@@ -1,0 +1,6 @@
+{$CONDUCTOR_DOMAIN} {
+    encode zstd gzip
+    reverse_proxy frontend:3000 {
+        flush_interval -1
+    }
+}

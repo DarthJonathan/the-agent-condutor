@@ -1,0 +1,71 @@
+name: conductor-remote
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: conductor
+      POSTGRES_USER: conductor
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set a unique POSTGRES_PASSWORD}
+    volumes:
+      - conductor-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U conductor -d conductor"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+  backend:
+    build: ./backend
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgres://conductor:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}@postgres:5432/conductor?sslmode=disable
+      PUBLIC_ORIGIN: ${PUBLIC_ORIGIN:-http://localhost:3005}
+      SESSION_SECRET: ${SESSION_SECRET:?Generate a unique SESSION_SECRET}
+      DEVELOPMENT: ${DEVELOPMENT:-false}
+      ALLOW_SIGNUP: ${ALLOW_SIGNUP:-false}
+    depends_on:
+      postgres: { condition: service_healthy }
+    read_only: true
+    tmpfs: [/tmp]
+  frontend:
+    build: ./frontend
+    restart: unless-stopped
+    environment:
+      BACKEND_API_URL: http://backend:8080
+      ORIGIN: ${PUBLIC_ORIGIN:-http://localhost:3005}
+      BODY_SIZE_LIMIT: 6M
+    ports:
+      - "127.0.0.1:${WEB_PORT:-3005}:3000"
+    depends_on: [backend]
+  backend-test:
+    profiles: [test]
+    build:
+      context: ./backend
+      target: test
+    environment:
+      CONDUCTOR_TEST_DATABASE_URL: postgres://conductor:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}@postgres:5432/conductor?sslmode=disable
+      GOCACHE: /tmp/go-cache
+    tmpfs: ["/tmp:rw,exec,size=3g"]
+    depends_on:
+      postgres: { condition: service_healthy }
+  backend-audit:
+    profiles: [test]
+    build:
+      context: ./backend
+      target: audit
+  https:
+    image: caddy:2-alpine
+    profiles: [https]
+    restart: unless-stopped
+    ports: ["80:80", "443:443"]
+    environment:
+      CONDUCTOR_DOMAIN: ${CONDUCTOR_DOMAIN:-localhost}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - conductor-caddy:/data
+      - conductor-caddy-config:/config
+    depends_on: [frontend]
+volumes:
+  conductor-db:
+  conductor-caddy:
+  conductor-caddy-config:

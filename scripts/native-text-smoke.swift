@@ -145,6 +145,7 @@ import SwiftUI
             document.addSubview(view); y += size.height + 16
         }
         document.setFrameSize(NSSize(width: 740, height: y))
+        verifyViewportTracking(scroll: nativeScroll, document: document)
         let passes = views.map(\.layoutPasses)
         let begin = ProcessInfo.processInfo.systemUptime
         for step in 0..<600 {
@@ -250,6 +251,31 @@ import SwiftUI
         expect(state.canFollow, "Trackpad scrolling back to the bottom must resume following")
         state.jumpToLatest(); expect(state.canFollow, "Jump to latest must resume following")
         print("User-scroll priority checks passed")
+    }
+    @MainActor private static func verifyViewportTracking(scroll: NSScrollView, document: NSView) {
+        let observer = TranscriptScrollObserverView(frame: .zero)
+        document.addSubview(observer)
+        var state = TranscriptFollowState()
+        var movements: [Bool] = []
+        observer.onEvent = { event in
+            if case .moved(let nearBottom) = event {
+                movements.append(nearBottom); state.moved(nearBottom: nearBottom)
+            }
+        }
+        // No live-scroll notifications: emulate actual clip movement from a
+        // mouse wheel, momentum, or dragging the scrollbar.
+        for step in 1...40 {
+            scroll.contentView.scroll(to: NSPoint(x: 0, y: CGFloat(step * 10)))
+            scroll.reflectScrolledClipView(scroll.contentView)
+        }
+        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.02))
+        expect(!state.canFollow && movements == [false], "Actual viewport movement must pause rendering without publishing for every pixel")
+        scroll.contentView.scroll(to: NSPoint(x: 0, y: max(0, document.bounds.height - scroll.contentView.bounds.height)))
+        scroll.reflectScrolledClipView(scroll.contentView)
+        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.02))
+        expect(state.canFollow && movements == [false, true], "Returning to the latest reply must resume delivery even without a live-scroll bracket")
+        observer.disconnect(); observer.removeFromSuperview()
+        print("Viewport tracking passed: wheel/scrollbar movement detected, per-pixel publications avoided, Latest restored")
     }
     private static func descendants(_ view: NSView) -> [NSView] { view.subviews.flatMap { [$0] + descendants($0) } }
     private static func expect(_ value: @autoclosure () -> Bool, _ reason: String) { if !value() { fatalError(reason) } }

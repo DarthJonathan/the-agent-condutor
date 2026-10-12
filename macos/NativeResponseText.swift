@@ -349,6 +349,7 @@ final class TranscriptScrollObserverView: NSView {
     private weak var observedScroll: NSScrollView?
     private var generation = 0
     private var lastNearBottom: Bool?
+    private var lastOrigin: NSPoint?
     override func viewDidMoveToSuperview() { super.viewDidMoveToSuperview(); connect() }
     override func viewDidMoveToWindow() { super.viewDidMoveToWindow(); connect() }
     override func layout() { super.layout(); connect() }
@@ -358,14 +359,17 @@ final class TranscriptScrollObserverView: NSView {
         guard let scroll = enclosingScrollView, observedScroll !== scroll else { return }
         NotificationCenter.default.removeObserver(self)
         observedScroll = scroll; generation += 1; lastNearBottom = nil
+        lastOrigin = scroll.contentView.bounds.origin
+        scroll.contentView.postsBoundsChangedNotifications = true
         let center = NotificationCenter.default
         center.addObserver(self, selector: #selector(started), name: NSScrollView.willStartLiveScrollNotification, object: scroll)
         center.addObserver(self, selector: #selector(moved), name: NSScrollView.didLiveScrollNotification, object: scroll)
         center.addObserver(self, selector: #selector(ended), name: NSScrollView.didEndLiveScrollNotification, object: scroll)
+        center.addObserver(self, selector: #selector(boundsChanged), name: NSView.boundsDidChangeNotification, object: scroll.contentView)
     }
     func disconnect() {
         NotificationCenter.default.removeObserver(self)
-        observedScroll = nil; onEvent = nil; generation += 1; lastNearBottom = nil
+        observedScroll = nil; onEvent = nil; generation += 1; lastNearBottom = nil; lastOrigin = nil
     }
     static func isNearBottom(_ scroll: NSScrollView) -> Bool {
         guard let document = scroll.documentView else { return true }
@@ -380,6 +384,14 @@ final class TranscriptScrollObserverView: NSView {
         guard lastNearBottom != nearBottom else { return }
         lastNearBottom = nearBottom
         send(.moved(nearBottom: nearBottom))
+    }
+    @objc private func boundsChanged() {
+        guard let scroll = observedScroll, lastOrigin != scroll.contentView.bounds.origin else { return }
+        lastOrigin = scroll.contentView.bounds.origin
+        // Mouse wheels and momentum do not always bracket movement with the
+        // live-scroll notifications. Track actual viewport movement too,
+        // without publishing state for every pixel or resizing the viewport.
+        moved()
     }
     @objc private func ended() { if let scroll = observedScroll { send(.ended(nearBottom: Self.isNearBottom(scroll))) } }
     private func send(_ event: TranscriptScrollEvent) {

@@ -45,10 +45,22 @@ with open(os.environ["TEAM_FIXTURE_CALLS"], "a") as f:
 if provider == "codex": print(json.dumps(dict(type="thread.started", thread_id=session)), flush=True)
 else: print(json.dumps(dict(type="system", subtype="init", session_id=session)), flush=True)
 if "SLOW" in body: time.sleep(30)
-if "USER ANSWERS" in body or "human declined" in body or "Actual result:" in body:
+if kind == "QuestionAnswer":
+    request = json.loads(re.search(r"\nDELEGATED QUESTION REQUEST\n([^\n]+)", prompt)[1])
+    questions = " ".join(q["question"] for q in request["questions"])
+    if "PEER_DELAY" in questions: time.sleep(30)
+    if "PEER_NEEDS_INPUT" in questions and "USER ANSWERS" not in body:
+        answer = '<conductor-ask>\n' + json.dumps({"questions":[{"question":"What workspace fact should I use?","options":[{"label":"Verified scope"}]}]}) + '\n</conductor-ask>'
+    else:
+        answers = [dict(question_id=q["id"], option_ids=[q["options"][0]["id"]] if q["options"] else [], text="Verified by " + handle + "; @maya is ordinary context", skipped=False) for q in request["questions"]]
+        if handle == "alex" and "PEER_BAD" in questions: answers[0]["option_ids"] = ["invalid-option"]
+        answer = 'I checked the shared task.\n<conductor-answer>\n' + json.dumps(dict(request_id=request["request_id"], answers=answers)) + '\n</conductor-answer>'
+elif "USER ANSWERS" in body or "TEAMMATE ANSWERS" in body or "human declined" in body or "Actual result:" in body:
     answer = "I continued using the human's decision in my own session."
 elif "ASK_QUESTION" in body:
-    answer = 'Need scope.\n<conductor-ask>\n' + json.dumps({"questions":[{"question":"Which scope?","options":[{"label":"Small"},{"label":"Full"}]}]}) + '\n</conductor-ask>'
+    marker = next((m for m in ["PEER_BAD", "PEER_NEEDS_INPUT", "PEER_DELAY", "PEER_FOUR"] if m in body), "")
+    question_items = [{"question":"Which scope for item " + str(i + 1) + "? " + marker,"options":[{"label":"Small"},{"label":"Full"}]} for i in range(4 if marker == "PEER_FOUR" else 1)]
+    answer = 'Need scope.\n<conductor-ask>\n' + json.dumps({"questions":question_items}) + '\n</conductor-ask>'
 elif "ASK_APPROVAL" in body:
     command = [sys.executable, "-c", "from pathlib import Path; Path('approved.txt').write_text('approved')"]
     answer = 'Need approval.\n<conductor-approval>\n' + json.dumps(dict(summary="Create the fixture marker", argv=command)) + '\n</conductor-approval>'
@@ -111,9 +123,9 @@ class Bridge:
             except queue.Empty: break
             if event["type"] in ("run_updated", "run_detail"):
                 self.latest[event["run"]["id"]] = event["run"]
+            if predicate(event): return event
             if event["type"] == "notice" and event["error"]:
                 raise AssertionError(event["message"])
-            if predicate(event): return event
         raise AssertionError("Timed out waiting for bridge; exit=" + str(self.proc.poll()))
     def finish(self, run_id=None, status="Completed"):
         event = self.wait(lambda e: e["type"] == "run_updated" and (run_id is None or e["run"]["id"] == run_id) and e["run"]["status"] in ("Completed", "Failed", "Cancelled", "Interrupted", "WaitingForUser"))
@@ -196,12 +208,80 @@ run = b.finish(rid)
 assert run["conversation"]["messages"][-1]["author_id"] == TEAM[2]["id"]
 assert run["conversation"]["messages"][-1]["session_id"] == owner_session
 
+def send_human_answers(message):
+    request = message["question_request"]
+    b.send(type="team_answer", run_id=rid, message_id=message["id"], request_id=request["id"],
+           answers=[dict(question_id=q["id"], option_ids=[q["options"][0]["id"]] if q["options"] else [], text="Human fact", skipped=False) for q in request["questions"]], settings=b.settings)
+
+def delegate(message, responder=TEAM[1]):
+    b.send(type="delegate_question", run_id=rid, message_id=message["id"], request_id=message["question_request"]["id"], coworker_id=responder["id"], settings=b.settings)
+
+# Same-connection coworkers answer in separate native sessions; quoted handles do not dispatch.
+b.chat("@noah ASK_QUESTION PEER_FOUR", rid)
+run = b.finish(rid, "WaitingForUser")
+question = run["conversation"]["messages"][-1]
+owner_session = question["session_id"]
+delegate(question, TEAM[2])
+b.wait(lambda e: e["type"] == "notice" and e["error"] and "another coworker" in e["message"])
+delegate(question)
+run = b.finish(rid)
+resolved = next(m for m in run["conversation"]["messages"] if m["id"] == question["id"])["question_request"]
+assert resolved["answered_by"] == TEAM[1]["id"] and len(resolved["answers"]) == 4 and all(a["option_ids"] == ["o1"] for a in resolved["answers"])
+assert run["conversation"]["messages"][-1]["session_id"] == owner_session
+peer = next(m for m in reversed(run["conversation"]["messages"]) if m["kind"] == "assistant" and m["author_id"] == TEAM[1]["id"])
+assert peer["session_id"] == alex_session and peer["session_id"] != owner_session
+answer = next(m for m in reversed(run["conversation"]["messages"]) if m["kind"] == "answer")
+assert answer["author_id"] == TEAM[1]["id"] and answer["recipient_ids"] == [TEAM[2]["id"]] and "User answer:" not in answer["text"]
+assert all(m["state"] == "completed" for m in run["conversation"]["mailbox"] if m.get("question_target", {}).get("request_id") == resolved["id"])
+
+# Invalid choices leave the original question open and can be retried with another connection.
+b.chat("@noah ASK_QUESTION PEER_BAD", rid)
+run = b.finish(rid, "WaitingForUser")
+question = run["conversation"]["messages"][-1]
+delegate(question)
+run = b.finish(rid, "WaitingForUser")
+assert next(m for m in run["conversation"]["messages"] if m["id"] == question["id"])["question_request"]["answers"] is None
+assert run["conversation"]["messages"][-1]["status"] == "Failed"
+delegate(question, TEAM[0])
+run = b.finish(rid)
+assert next(m for m in run["conversation"]["messages"] if m["id"] == question["id"])["question_request"]["answered_by"] == TEAM[0]["id"]
+
+# A teammate can ask the human first; answering it resumes the assigned teammate, then the asker.
+b.chat("@noah ASK_QUESTION PEER_NEEDS_INPUT", rid)
+run = b.finish(rid, "WaitingForUser")
+question = run["conversation"]["messages"][-1]
+delegate(question)
+run = b.finish(rid, "WaitingForUser")
+peer_question = run["conversation"]["messages"][-1]
+assert peer_question["author_id"] == TEAM[1]["id"] and peer_question["question_request"]["answers"] is None
+peer_session = peer_question["session_id"]
+send_human_answers(peer_question)
+run = b.finish(rid)
+assert next(m for m in run["conversation"]["messages"] if m["id"] == question["id"])["question_request"]["answered_by"] == TEAM[1]["id"]
+assert next(m for m in reversed(run["conversation"]["messages"]) if m["kind"] == "assistant" and m["author_id"] == TEAM[1]["id"])["session_id"] == peer_session
+
+# Cancelling a running answer request does not choose answers or invoke the original asker.
+b.chat("@noah ASK_QUESTION PEER_DELAY", rid)
+run = b.finish(rid, "WaitingForUser")
+question = run["conversation"]["messages"][-1]
+delegate(question)
+active = b.wait(lambda e: e["type"] == "run_updated" and e["run"]["status"] == "Running")["run"]
+assignment = next(m for m in active["conversation"]["mailbox"] if m.get("question_target", {}).get("request_id") == question["question_request"]["id"])
+b.send(type="cancel_mail", run_id=rid, mail_id=assignment["id"])
+run = b.finish(rid, "WaitingForUser")
+assert next(m for m in run["conversation"]["messages"] if m["id"] == question["id"])["question_request"]["answers"] is None
+assert next(m for m in run["conversation"]["mailbox"] if m["id"] == assignment["id"])["state"] == "cancelled"
+send_human_answers(question)
+run = b.finish(rid)
+
 # Decline executes nothing. Approve executes the exact argv once and records the real result.
 for approved in (False, True):
     b.chat("@alex ASK_APPROVAL", rid)
     run = b.finish(rid, "WaitingForUser")
     message = run["conversation"]["messages"][-1]
     approval = message["approval_request"]
+    b.send(type="delegate_question", run_id=rid, message_id=message["id"], request_id=approval["id"], coworker_id=TEAM[2]["id"], settings=b.settings)
+    b.wait(lambda e: e["type"] == "notice" and e["error"] and "unanswered question" in e["message"])
     b.send(type="team_approval", run_id=rid, message_id=message["id"], request_id=approval["id"], approved=approved, settings=b.settings)
     run = b.finish(rid)
     assert Path(run["workspace"], "approved.txt").exists() == approved
@@ -269,5 +349,5 @@ if "--prepare-swift" in sys.argv:
 b.close()
 saved = next(r for r in json.loads((DATA / "state" / "runs.json").read_text()) if r["id"] == fresh_id)
 assert [m["reasoning"] for m in saved["conversation"]["messages"] if m["kind"] == "assistant"] == [m["reasoning"] for m in fresh["conversation"]["messages"] if m["kind"] == "assistant"]
-print("Team smoke passed: duplicate connections, independent models/efforts/sessions, persisted thinking separate from answers, mailbox routing/cancellation/bounds, durable questions, approval decisions, real checks, isolation and deliberate sharing.")
+print("Team smoke passed: independent sessions, teammate question answers and attribution, invalid answer recovery, nested human questions, cancellation, mailbox bounds, durable questions, approvals, checks and workspace isolation.")
 print("Team fixture data: " + str(DATA / "state"))

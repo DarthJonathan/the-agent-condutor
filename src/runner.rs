@@ -2022,6 +2022,31 @@ fn every_cli_uses_its_native_effort_argument_and_default_is_omitted() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn codex_max_effort_is_forwarded_for_default_model_and_resumed_sessions() {
+    let (_dir, mut plan) = tests::fixture("", Provider::Codex);
+    let task = &mut plan.tasks[0];
+    task.config.model.clear();
+    task.config.effort = Effort::Max;
+    for session in [None, Some("codex-native-session".to_owned())] {
+        task.resume_session = session.clone();
+        let (args, input) = cli_arguments(task, "message");
+        assert_eq!(input.as_deref(), Some("message"));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["-c", "model_reasoning_effort=\"max\""])
+        );
+        assert!(!args.iter().any(|arg| arg == "--model"));
+        if let Some(session) = session {
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair == ["resume", session.as_str()])
+            );
+        }
+    }
+}
+
 #[test]
 fn direct_deepseek_effort_defaults_and_thinking_off_are_explicit() {
     assert!(

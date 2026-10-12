@@ -91,7 +91,7 @@ pub fn catalogs(settings: &Settings, snapshot: &Snapshot) -> Vec<ModelCatalog> {
                     if settings.deepseek_mode == DeepSeekMode::DirectApi { levels.insert(0, Effort::None); }
                     levels
                 }
-                Provider::Codex => vec![Effort::Low, Effort::Medium, Effort::High, Effort::Xhigh],
+                Provider::Codex => vec![Effort::Low, Effort::Medium, Effort::High, Effort::Xhigh, Effort::Max],
                 Provider::Antigravity => vec![Effort::Low, Effort::Medium, Effort::High],
                 _ => vec![Effort::Low, Effort::Medium, Effort::High, Effort::Xhigh, Effort::Max],
             };
@@ -104,7 +104,7 @@ pub fn catalogs(settings: &Settings, snapshot: &Snapshot) -> Vec<ModelCatalog> {
                 Provider::Claude if claude_deepseek => "DeepSeek supports Low, High, and Max through Claude Code.",
                 Provider::DeepSeek if settings.deepseek_mode == DeepSeekMode::DirectApi => "Off disables thinking; Low, High, and Max enable it.",
                 Provider::DeepSeek => "DeepSeek supports Low, High, and Max through Claude Code.",
-                Provider::Codex => "Levels come from the selected model's local Codex catalogue. Select a model to see its full range.",
+                Provider::Codex => "Explicit models use their local Codex capability metadata. Default and custom models offer levels through Max; Codex checks model and account limits. Select a model to see its full range.",
                 Provider::Antigravity => "Antigravity headless supports Low, Medium, and High.",
                 Provider::Qoder => "Available levels depend on the model; Qoder applies its model limits.",
                 Provider::Kiro => "Kiro applies the selected model's supported levels. Requires a CLI with --effort support.",
@@ -266,7 +266,7 @@ mod tests {
     #[test]
     fn codex_effort_levels_are_model_specific_and_filter_unknown_values() {
         let file = tempfile::NamedTempFile::new().unwrap();
-        fs::write(file.path(), r#"{"models":[{"slug":"full","supported_reasoning_levels":[{"effort":"low"},{"effort":"max"},{"effort":"ultra"},{"effort":"low"},{"effort":"invalid"}],"default_reasoning_level":"max"},{"slug":"plain","supported_reasoning_levels":[]},{"slug":"older"}]}"#).unwrap();
+        fs::write(file.path(), r#"{"models":[{"slug":"full","supported_reasoning_levels":[{"effort":"low"},{"effort":"max"},{"effort":"ultra"},{"effort":"low"},{"effort":"invalid"}],"default_reasoning_level":"max"},{"slug":"plain","supported_reasoning_levels":[]},{"slug":"older"},{"slug":"limited","supported_reasoning_levels":[{"effort":"low"},{"effort":"high"}]}]}"#).unwrap();
         let options = codex_models(file.path());
         assert_eq!(
             options[0].effort_levels,
@@ -279,7 +279,7 @@ mod tests {
             provider: Provider::Codex,
             source: String::new(),
             options,
-            effort_levels: vec![Effort::Low, Effort::High],
+            effort_levels: vec![Effort::Low, Effort::High, Effort::Max],
             effort_note: String::new(),
         };
         assert_eq!(
@@ -287,7 +287,11 @@ mod tests {
             [Effort::Low, Effort::Max, Effort::Ultra]
         );
         assert!(catalog.levels("plain").is_empty());
-        assert_eq!(catalog.levels("custom"), [Effort::Low, Effort::High]);
+        assert_eq!(catalog.levels("limited"), [Effort::Low, Effort::High]);
+        assert_eq!(
+            catalog.levels("custom"),
+            [Effort::Low, Effort::High, Effort::Max]
+        );
     }
 
     #[test]
@@ -300,6 +304,12 @@ mod tests {
         let snapshot = crate::claude_config::inspect("", "/nonexistent-conductor-fixture").snapshot;
         let catalogs = catalogs(&settings, &snapshot);
         let for_provider = |provider| catalogs.iter().find(|c| c.provider == provider).unwrap();
+        assert!(
+            for_provider(Provider::Codex)
+                .levels("")
+                .contains(&Effort::Max)
+        );
+        assert!(validate_effort(&settings, &snapshot, Provider::Codex, "", Effort::Max).is_ok());
         assert_eq!(
             for_provider(Provider::Claude).levels("deepseek-flash"),
             [Effort::Low, Effort::High, Effort::Max]

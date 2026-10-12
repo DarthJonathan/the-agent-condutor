@@ -381,6 +381,8 @@ pub struct Run {
     pub workspace_info: Option<crate::workspace::WorkspaceInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub changes: Option<crate::workspace::ChangeSet>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dismissed_attention: Vec<crate::inbox::Key>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -691,8 +693,23 @@ impl Conversation {
             .collect();
         let mut total: usize = sizes.iter().sum();
         while self.messages.len() > 128 || (total > 4 * 1024 * 1024 && self.messages.len() > 2) {
-            self.messages.remove(1);
-            total -= sizes.remove(1);
+            // A delegated question can stay open while another session writes
+            // a large reply. Keep its card and any human approval until resolved.
+            let Some(index) = (1..self.messages.len().saturating_sub(1)).find(|&index| {
+                let message = &self.messages[index];
+                !message
+                    .question_request
+                    .as_ref()
+                    .is_some_and(|q| q.answers.is_none())
+                    && !message
+                        .approval_request
+                        .as_ref()
+                        .is_some_and(|q| q.decision.is_none())
+            }) else {
+                break;
+            };
+            self.messages.remove(index);
+            total -= sizes.remove(index);
         }
     }
 }
@@ -710,6 +727,7 @@ impl Run {
             conversation: None,
             workspace_info: None,
             changes: None,
+            dismissed_attention: vec![],
             stages: settings
                 .agents
                 .iter()
