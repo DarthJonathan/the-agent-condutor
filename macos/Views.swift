@@ -48,7 +48,13 @@ private struct SidebarView: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 9) {
-                Image(systemName: "waveform").font(.system(size: 24, weight: .semibold)).foregroundStyle(Theme.accent)
+                if let icon = NSImage(named: "AppIcon") {
+                    Image(nsImage: icon).resizable().interpolation(.high).frame(width: 32, height: 32)
+                        .accessibilityHidden(true)
+                } else {
+                    Image(systemName: "waveform").font(.system(size: 24, weight: .semibold)).foregroundStyle(Theme.accent)
+                        .accessibilityHidden(true)
+                }
                 Text("Conductor").font(.system(size: 16, weight: .semibold))
                 Spacer()
             }.padding(.horizontal, 20).padding(.top, 23).padding(.bottom, 24)
@@ -176,7 +182,7 @@ private struct WorkspaceView: View {
     @EnvironmentObject private var store: EngineStore
     var body: some View {
         GeometryReader { geometry in
-            if store.chatting { WorkspaceChatView(run: store.chatRun, teamWidth: geometry.size.width < 930 ? 242 : 270) }
+            if store.chatting { WorkspaceChatView(run: store.chatRun, availableWidth: geometry.size.width, teamWidth: geometry.size.width < 930 ? 242 : 270) }
             else { ScrollView { WorkspaceContent(teamWidth: geometry.size.width < 930 ? 242 : 270) } }
         }
     }
@@ -283,17 +289,71 @@ private struct ChatRecipientPicker: View {
 
 private struct MentionSuggestions: View {
     @EnvironmentObject private var store: EngineStore
+    private var identities: [AgentIdentity] { store.chatIdentities }
     var body: some View {
-        HStack(spacing: 7) {
-            if store.usesCoworkerTeams {
-                ForEach(store.coworkers) { worker in Button("@\(worker.mention)") { store.mentionCoworker(worker) }.font(.system(size: 10)).controlSize(.small) }
-            } else {
-            ForEach(store.chatMembers) { provider in
-                Button("@\(store.identity(provider).mention)") { store.mention(provider) }
-                    .font(.system(size: 10)).controlSize(.small).help("Address \(store.displayName(provider)) (\(provider.name)) in this task")
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 7) { chips }.fixedSize(horizontal: true, vertical: false)
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 100, maximum: 160), spacing: 7)], alignment: .leading, spacing: 7) { chips }
+        }.frame(maxWidth: .infinity, alignment: .leading)
+    }
+    private var chips: some View {
+        ForEach(identities) { identity in
+            Button {
+                if store.usesCoworkerTeams, let worker = store.coworkers.first(where: { $0.id == identity.id }) { store.mentionCoworker(worker) }
+                else { store.mention(identity.provider) }
+            } label: {
+                Text("@\(identity.mention)").font(.system(size: 10)).lineLimit(1).truncationMode(.middle)
             }
+            .controlSize(.small).help("Address \(identity.name) (\(identity.provider.name)) in this task")
+        }
+    }
+}
+
+struct ChatComposerFooter: View {
+    @EnvironmentObject private var store: EngineStore
+    var loading = false
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 12) {
+                    recipient.fixedSize(horizontal: true, vertical: false)
+                    model.frame(width: 195)
+                    Spacer(minLength: 12)
+                    send.fixedSize(horizontal: true, vertical: false)
+                }
+                VStack(alignment: .leading, spacing: 12) {
+                    HStack(spacing: 12) {
+                        recipient
+                        model.frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    HStack { Spacer(minLength: 0); send }
+                }
             }
-            Spacer(minLength: 0)
+            Toggle("Team discussion", isOn: $store.teamDiscussion).toggleStyle(.checkbox).font(.system(size: 12))
+                .disabled(store.busy || loading || (store.chatIdentities.count < 2 && !store.teamDiscussion))
+                .help("The lead asks every teammate for feedback, then responds in the same chat.")
+            if store.teamDiscussion {
+                Text(store.usesCoworkerTeams ? "The lead answers, each teammate reviews, then the lead synthesizes their feedback." : store.discussionHint)
+                    .font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            } else { MentionSuggestions() }
+            if store.usesCoworkerTeams, let warning = coworkerMentions(store.prompt, coworkers: store.coworkers).ambiguous {
+                Text(warning).font(.system(size: 11)).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
+            }
+        }.frame(maxWidth: .infinity, alignment: .leading)
+    }
+    private var recipient: some View {
+        ChatRecipientPicker().frame(maxWidth: 160).disabled((store.busy && !store.canQueueMessage) || loading)
+    }
+    @ViewBuilder private var model: some View {
+        if store.usesCoworkerTeams, let worker = store.effectiveCoworker { CoworkerModelMenu(worker: worker) }
+        else { AgentModelPicker(provider: store.effectiveLead) }
+    }
+    private var send: some View {
+        HStack(spacing: 8) {
+            Text("⌘ ↵").font(.system(size: 11)).foregroundStyle(.tertiary)
+            Button(action: store.startRun) { Label(store.busy ? (store.canQueueMessage ? "Queue" : "Working…") : store.teamDiscussion ? "Discuss" : "Send", systemImage: store.teamDiscussion ? "bubble.left.and.bubble.right" : "arrow.up") }
+                .buttonStyle(.borderedProminent).disabled(!store.canRun)
         }
     }
 }
@@ -302,8 +362,10 @@ private struct WorkspaceChatView: View {
     @EnvironmentObject private var store: EngineStore
     @State private var messageFocused = false
     let run: RunRecord?
+    let availableWidth: CGFloat
     let teamWidth: CGFloat
     var preview = false
+    private var inspectorWidth: CGFloat { store.usesCoworkerTeams && store.inspectorTab == "changes" ? max(teamWidth, 360) : teamWidth }
     private var loading: Bool { store.workspaceSelectionPending }
     private var title: String { run?.summary.title ?? (loading ? store.workspaceRuns.first { $0.id == store.selectedRunID }?.title : nil) ?? "New conversation" }
     var body: some View {
@@ -359,25 +421,12 @@ private struct WorkspaceChatView: View {
                             MentionComposer(text: $store.prompt, focused: $messageFocused, identities: store.chatIdentities,
                                             enabled: !loading && !store.hasPendingQuestions, fontSize: 15, height: 90, accessibilityLabel: "Conversation message")
                         }
-                        HStack {
-                            ChatRecipientPicker().frame(maxWidth: 160).disabled((store.busy && !store.canQueueMessage) || loading)
-                            if store.usesCoworkerTeams, let worker = store.effectiveCoworker { CoworkerModelMenu(worker: worker).frame(maxWidth: 145) }
-                            else { AgentModelPicker(provider: store.effectiveLead).frame(maxWidth: 170) }
-                            Spacer()
-                            Text("⌘ ↵").font(.system(size: 11)).foregroundStyle(.tertiary)
-                            Button(action: store.startRun) { Label(store.busy ? (store.canQueueMessage ? "Queue" : "Working…") : store.teamDiscussion ? "Discuss" : "Send", systemImage: store.teamDiscussion ? "bubble.left.and.bubble.right" : "arrow.up") }
-                                .buttonStyle(.borderedProminent).disabled(!store.canRun)
-                        }
-                        Toggle("Team discussion", isOn: $store.teamDiscussion).toggleStyle(.checkbox).font(.system(size: 12))
-                            .disabled(store.busy || loading || (store.chatIdentities.count < 2 && !store.teamDiscussion))
-                            .help("The lead asks every teammate for feedback, then responds in the same chat.")
-                        if store.teamDiscussion {
-                            Text(store.usesCoworkerTeams ? "The lead answers, each teammate reviews, then the lead synthesizes their feedback." : store.discussionHint).font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                        } else { MentionSuggestions() }
-                        if store.usesCoworkerTeams, let warning = coworkerMentions(store.prompt, coworkers: store.coworkers).ambiguous { Text(warning).font(.system(size: 11)).foregroundStyle(.orange) }
+                        ChatComposerFooter(loading: loading)
                     }
                 }
-            }.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            // A concrete column width prevents the stack from repeatedly asking
+            // the entire Markdown transcript and native controls for ideal sizes.
+            }.frame(width: max(0, availableWidth - inspectorWidth - 88)).frame(maxHeight: .infinity, alignment: .top)
             Group {
                 if store.usesCoworkerTeams {
                     VStack(spacing: 14) {
@@ -389,7 +438,7 @@ private struct WorkspaceChatView: View {
                         else { ScrollView { CoworkerTeamPanel() } }
                     }
                 } else { ScrollView { TeamPanel() } }
-            }.frame(width: store.usesCoworkerTeams && store.inspectorTab == "changes" ? max(teamWidth, 360) : teamWidth).disabled(loading)
+            }.frame(width: inspectorWidth).disabled(loading)
         }.padding(32)
             .onAppear { messageFocused = !loading }
             .onChange(of: loading) { _, pending in if !pending { messageFocused = true } }
@@ -460,7 +509,7 @@ private struct ChatMessageView: View {
             if message.error != message.text {
                 if message.text.isEmpty && message.questionRequest == nil { Text(message.status == .queued ? "Waiting for this agent…" : message.status == .running ? "Thinking…" : "No response text.").font(.system(size: 12)).foregroundStyle(.secondary) }
                 else {
-                    ForEach(store.renderedChat[message.id] ?? []) { block in ResponseBlockContent(block: block) }
+                    ForEach(store.renderedChat[message.id] ?? []) { block in ResponseBlockContent(block: block).equatable() }
                 }
             }
             if let request = message.questionRequest {
@@ -591,7 +640,7 @@ private struct AgentQuestionRow: View {
     }
 }
 
-struct ResponseBlockContent: View {
+struct ResponseBlockContent: View, Equatable {
     let block: ResponseBlock
     var body: some View {
         switch block.kind {
@@ -625,7 +674,7 @@ struct ResponseBlockContent: View {
     }
     private func descendants(spacing: CGFloat) -> some View {
         VStack(alignment: .leading, spacing: spacing) {
-            ForEach(block.children) { child in ResponseBlockContent(block: child) }
+            ForEach(block.children) { child in ResponseBlockContent(block: child).equatable() }
         }.frame(maxWidth: .infinity, alignment: .leading)
     }
 }
@@ -1555,8 +1604,8 @@ private struct CoworkerModelMenu: View {
             Button("Default · \(store.defaultModel(worker.provider))") { choose("") }
             ForEach(store.modelOptions(worker.provider)) { option in Button(option.label) { choose(option.id) } }
             Divider(); Button("Custom model…") { editing = true }
-        } label: { Label(store.coworkerModelLabel(worker), systemImage: "cpu").font(.system(size: 11)).lineLimit(1) }
-            .menuStyle(.borderlessButton).disabled(!store.canChangeChatModels).help("Model for \(worker.name)")
+        } label: { Label(store.coworkerModelLabel(worker), systemImage: "cpu").font(.system(size: 11)).lineLimit(1).truncationMode(.middle).frame(maxWidth: .infinity, alignment: .leading) }
+            .menuStyle(.borderlessButton).disabled(!store.canChangeChatModels).help("Model for \(worker.name): \(store.coworkerModelLabel(worker))")
             .sheet(isPresented: $editing) { CoworkerEditSheet(worker: worker) }
     }
     private func choose(_ model: String) { var edited = worker; edited.model = model; if let error = store.updateCoworker(edited) { store.notice = error; store.noticeIsError = true } }
@@ -1785,7 +1834,7 @@ struct LayoutPreview: View {
                 if store.screen == "connections" { ConnectionsContent() }
                 else if store.screen == "attention" { AttentionInboxView(scrollable: false) }
                 else if store.screen == "history" { HistoryView() }
-                else if store.chatting { WorkspaceChatView(run: store.chatRun, teamWidth: width - 213 < 930 ? 242 : 270, preview: true) }
+                else if store.chatting { WorkspaceChatView(run: store.chatRun, availableWidth: width - 213, teamWidth: width - 213 < 930 ? 242 : 270, preview: true) }
                 else { WorkspaceContent(teamWidth: width - 213 < 930 ? 242 : 270) }
             }.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         }.background(Theme.background)

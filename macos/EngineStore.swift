@@ -2,6 +2,40 @@ import AppKit
 import Foundation
 import SwiftUI
 
+// Keep one main-queue delivery scheduled. If layout is busy, replace adjacent
+// streaming snapshots with their latest value; preserve every control transition.
+final class EventDelivery {
+    private typealias Snapshot = (EngineEvent, [Provider: [ResponseBlock]], [String: [ResponseBlock]])
+    private let lock = NSLock()
+    private var pending: [Snapshot] = []
+    private var scheduled = false
+    private let receive: @MainActor (EngineEvent, [Provider: [ResponseBlock]], [String: [ResponseBlock]]) -> Void
+    init(receive: @escaping @MainActor (EngineEvent, [Provider: [ResponseBlock]], [String: [ResponseBlock]]) -> Void) {
+        self.receive = receive
+    }
+    func enqueue(_ event: EngineEvent, rendered: [Provider: [ResponseBlock]], chat: [String: [ResponseBlock]]) {
+        lock.lock()
+        let snapshot = (event, rendered, chat)
+        if event.type == "run_updated", event.run?.status == .running,
+           let last = pending.last, last.0.type == "run_updated", last.0.run?.status == .running, last.0.run?.id == event.run?.id {
+            pending[pending.count - 1] = snapshot
+        } else { pending.append(snapshot) }
+        if !scheduled {
+            scheduled = true
+            DispatchQueue.main.async { [self] in drain() }
+        }
+        lock.unlock()
+    }
+    @MainActor private func drain() {
+        lock.lock()
+        let snapshots = pending
+        pending.removeAll(keepingCapacity: true)
+        scheduled = false
+        lock.unlock()
+        for (event, rendered, chat) in snapshots { receive(event, rendered, chat) }
+    }
+}
+
 // Pipe framing and decoding stay off the main queue, including long agent responses.
 private final class EventReader {
     private let queue = DispatchQueue(label: "dev.agentconductor.events", qos: .userInitiated)
@@ -433,8 +467,9 @@ final class EngineStore: ObservableObject {
         child.standardError = errors
         input = incoming.fileHandleForWriting
         output = outgoing.fileHandleForReading
-        reader = EventReader(receive: { [weak self] event, rendered, chat in
-            DispatchQueue.main.async { self?.apply(event, rendered: rendered, chat: chat) }
+        let delivery = EventDelivery { [weak self] event, rendered, chat in self?.apply(event, rendered: rendered, chat: chat) }
+        reader = EventReader(receive: { event, rendered, chat in
+            delivery.enqueue(event, rendered: rendered, chat: chat)
         }, fail: { [weak self] message in
             DispatchQueue.main.async { self?.showNotice(message, error: true) }
         })
@@ -505,8 +540,8 @@ final class EngineStore: ObservableObject {
         case "run_updated", "run_detail":
             guard let run = event.run else { return }
             for message in run.conversation?.messages ?? [] {
-                if let request = message.questionRequest, request.answers != nil { pendingQuestionReplies.remove(request.id) }
-                if let request = message.approvalRequest, request.decision != nil { pendingQuestionReplies.remove(request.id) }
+                if let request = message.questionRequest, request.answers != nil, pendingQuestionReplies.contains(request.id) { pendingQuestionReplies.remove(request.id) }
+                if let request = message.approvalRequest, request.decision != nil, pendingQuestionReplies.contains(request.id) { pendingQuestionReplies.remove(request.id) }
             }
             if pendingChat && event.type == "run_updated" && run.status.active && run.conversation?.messages.last(where: { $0.kind == "user" })?.text == submittedChatPrompt {
                 pendingChat = false
@@ -515,7 +550,10 @@ final class EngineStore: ObservableObject {
                 composingNewTask = false
                 screen = "workspace"
             }
-            if let index = runs.firstIndex(where: { $0.id == run.id }) { runs[index] = run.summary }
+            if let index = runs.firstIndex(where: { $0.id == run.id }) {
+                let summary = run.summary
+                if runs[index] != summary { runs[index] = summary }
+            }
             else {
                 runs.insert(run.summary, at: 0)
                 runs = Array(runs.prefix(100))
@@ -531,18 +569,19 @@ final class EngineStore: ObservableObject {
             if selectedRunID == run.id {
                 let loadingConversation = selectedRun?.id != run.id || event.type == "run_detail"
                 selectedRun = run
-                renderedResponses = rendered
-                renderedChat = chat
+                if renderedResponses != rendered { renderedResponses = rendered }
+                if renderedChat != chat { renderedChat = chat }
                 if let conversation = run.conversation {
                     if loadingConversation { chatLead = conversation.lead; coworkerLead = conversation.leadId ?? conversation.coworkers?.first?.id ?? "" }
-                    composingNewTask = false
-                    composerExpanded = true
+                    if composingNewTask { composingNewTask = false }
+                    if !composerExpanded { composerExpanded = true }
                 }
                 if selectedProvider == nil || !run.stages.contains(where: { $0.provider == selectedProvider }) {
-                    selectedProvider = run.stages.first?.provider
+                    let provider = run.stages.first?.provider
+                    if selectedProvider != provider { selectedProvider = provider }
                 }
             }
-            if !run.status.active { cancelling.remove(run.id) }
+            if !run.status.active && cancelling.contains(run.id) { cancelling.remove(run.id) }
             if options.smoke && smokeStarted && run.id == smokeRunID && !run.status.active && !pendingChat && !smokeCompletionScheduled {
                 if smokeChatStep == 5, run.status == .waitingForUser,
                    let message = run.conversation?.pendingQuestions.last, let request = message.questionRequest {

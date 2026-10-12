@@ -254,7 +254,7 @@ struct Stage: Decodable, Identifiable {
     var id: Provider { provider }
 }
 
-struct RunSummary: Decodable, Identifiable {
+struct RunSummary: Decodable, Identifiable, Equatable {
     let id: String
     let title: String
     let workspace: String
@@ -399,7 +399,7 @@ struct MailboxDelivery: Decodable, Identifiable {
     }
 }
 
-struct AttentionItem: Decodable, Identifiable {
+struct AttentionItem: Decodable, Identifiable, Equatable {
     let id: String
     let messageId: String?
     let ownerId: String?
@@ -793,8 +793,8 @@ struct LaunchOptions {
     }
 }
 
-struct ResponseBlock: Identifiable {
-    enum Kind {
+struct ResponseBlock: Identifiable, Equatable {
+    enum Kind: Equatable {
         case heading(Int), text, code(language: String?)
         case list, listItem(number: Int?, checked: Bool?), quote, divider
         case table(columns: [PresentationIntent.TableColumn.Alignment])

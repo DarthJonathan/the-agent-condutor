@@ -13,6 +13,8 @@ open "dist/Agent Conductor.app"
 
 Use `bash scripts/bundle-macos.sh --debug` for a faster development build. The bundle contains the SwiftUI application and a separate `conductor-engine` helper. This is a local ad-hoc signature; the bundle is not notarized for distribution.
 
+The build generates a full macOS icon set from `macos/Assets/AppIcon.png` and embeds it in the bundle. The original image generation prompt is saved beside the artwork. Install the finished app with `ditto "dist/Agent Conductor.app" "/Applications/Agent Conductor.app"`, then open it from Applications.
+
 Preview sample runs without invoking providers or writing settings/history:
 
 ```sh
@@ -202,6 +204,17 @@ target/team-store-smoke-test
 ```
 
 For populated Inbox, question, approval, team and Changes layout previews, run `python3 scripts/team-smoke.py --prepare-swift`, then pass the printed data directory's `runs.json` to `target/team-store-smoke-test PATH/runs.json --render`. It writes `target/team-*-preview.png`; AppKit controls may appear as unsupported placeholders in ImageRenderer, while native store tests exercise their state transitions.
+
+Check UI event delivery under backpressure and response layouts:
+
+```sh
+xcrun swiftc -swift-version 5 -warnings-as-errors -target "$(uname -m)-apple-macosx14.0" -module-cache-path target/swift-module-cache macos/Models.swift macos/MentionEditor.swift macos/EngineStore.swift macos/Views.swift scripts/responsiveness-smoke.swift -o target/responsiveness-smoke-test
+target/responsiveness-smoke-test --delivery-only
+target/responsiveness-smoke-test --render-only
+target/responsiveness-smoke-test
+```
+
+The delivery check queues 1,000 streaming snapshots before the main loop can consume them, verifying that only the latest adjacent running snapshot is delivered and that start, question, notice and completion events retain their order. Chat columns have concrete widths, unchanged Markdown blocks are retained, and unchanged metadata does not publish additional updates. The native window fixture measures main-loop delays during waiting, streamed responses, mention completion and inspector switching; it uses synthetic data and never launches an engine or provider. Native window mode requires access to the desktop, while the two other modes work without opening a window. ImageRenderer omits AppKit controls and is a layout check, not a substitute for native responsiveness measurements.
 
 Check Markdown parsing and render a layout fixture with tables, lists, quotes, and code:
 

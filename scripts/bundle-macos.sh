@@ -19,8 +19,21 @@ else
 fi
 
 conductor_bundle="dist/Agent Conductor.app"
-mkdir -p "$conductor_bundle/Contents/MacOS"
+mkdir -p "$conductor_bundle/Contents/MacOS" "$conductor_bundle/Contents/Resources"
 install -m 755 "target/$conductor_profile/agent-conductor" "$conductor_bundle/Contents/MacOS/conductor-engine"
+
+# Keep the full-resolution artwork as the source of every macOS icon size.
+conductor_iconset="target/AppIcon.iconset"
+mkdir -p "$conductor_iconset"
+for conductor_icon_size in 16 32 128 256 512; do
+  sips -z "$conductor_icon_size" "$conductor_icon_size" macos/Assets/AppIcon.png \
+    --out "$conductor_iconset/icon_${conductor_icon_size}x${conductor_icon_size}.png" >/dev/null
+  conductor_retina_size=$((conductor_icon_size * 2))
+  sips -z "$conductor_retina_size" "$conductor_retina_size" macos/Assets/AppIcon.png \
+    --out "$conductor_iconset/icon_${conductor_icon_size}x${conductor_icon_size}@2x.png" >/dev/null
+done
+iconutil -c icns "$conductor_iconset" -o "$conductor_bundle/Contents/Resources/AppIcon.icns"
+
 mkdir -p target/swift-module-cache
 conductor_arch="$(uname -m)"
 conductor_swift_options=(-O)
@@ -41,6 +54,7 @@ cat > "$conductor_bundle/Contents/Info.plist" <<'PLIST'
   <key>CFBundleName</key><string>Agent Conductor</string>
   <key>CFBundleDisplayName</key><string>Agent Conductor</string>
   <key>CFBundleExecutable</key><string>agent-conductor</string>
+  <key>CFBundleIconFile</key><string>AppIcon.icns</string>
   <key>CFBundleIdentifier</key><string>dev.agentconductor.desktop</string>
   <key>CFBundleVersion</key><string>1</string>
   <key>CFBundleShortVersionString</key><string>0.1.0</string>

@@ -167,37 +167,66 @@ struct MentionComposer: View {
     let accessibilityLabel: String
     @StateObject private var completion = MentionCompletionController()
     var body: some View {
-        NativeMentionEditor(text: $text, focused: $focused, identities: identities, controller: completion,
-                            enabled: enabled, fontSize: fontSize, height: height, accessibilityLabel: accessibilityLabel)
-            .frame(height: height)
-            .overlay(alignment: .topLeading) {
-                if !completion.suggestions.isEmpty {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Mention a teammate").font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary).padding(.horizontal, 9).padding(.bottom, 3)
-                        ForEach(Array(completion.suggestions.enumerated()), id: \.element.id) { index, identity in
-                            Button { completion.choose(identity) } label: {
-                                HStack(spacing: 10) {
-                                    Text(String(identity.name.prefix(1)).uppercased()).font(.system(size: 12, weight: .semibold))
-                                        .foregroundStyle(identity.provider.tint).frame(width: 28, height: 28)
-                                        .background(identity.provider.tint.opacity(0.13), in: Circle())
-                                    VStack(alignment: .leading, spacing: 3) {
-                                        Text(identity.name).font(.system(size: 12, weight: .medium)).foregroundStyle(.primary)
-                                        Text(identity.provider.name).font(.system(size: 10)).foregroundStyle(.secondary)
-                                    }
-                                    Spacer(minLength: 8)
-                                    Text("@\(identity.mention)").font(.system(size: 11)).foregroundStyle(Theme.accent)
-                                }.padding(8).frame(maxWidth: .infinity, alignment: .leading)
-                                    .background(index == completion.selectedIndex ? Theme.accent.opacity(0.14) : .clear, in: RoundedRectangle(cornerRadius: 6))
-                            }.buttonStyle(.plain).focusable(false).onHover { hovering in if hovering { completion.highlight(index) } }
-                                .accessibilityLabel("Mention \(identity.name), \(identity.provider.name), @\(identity.mention)")
+        // Reserve space above the editor so suggestions never paint over the
+        // recipient, model or send controls, even in a narrow inspector layout.
+        VStack(alignment: .leading, spacing: 8) {
+            if !completion.suggestions.isEmpty {
+                MentionCompletionMenu(suggestions: completion.suggestions, selectedIndex: completion.selectedIndex,
+                                      choose: { completion.choose($0) }, highlight: completion.highlight)
+            }
+            NativeMentionEditor(text: $text, focused: $focused, identities: identities, controller: completion,
+                                enabled: enabled, fontSize: fontSize, height: height, accessibilityLabel: accessibilityLabel)
+                .frame(height: height)
+        }.frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+struct MentionCompletionMenu: View {
+    let suggestions: [AgentIdentity]
+    let selectedIndex: Int
+    let choose: (AgentIdentity) -> Void
+    let highlight: (Int) -> Void
+    private let rowHeight: CGFloat = 48
+    var body: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            Text("Mention a teammate").font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary).padding(.horizontal, 9)
+            if suggestions.count <= 3 { rows }
+            else {
+                ScrollViewReader { proxy in
+                    ScrollView { rows.padding(.trailing, 10) }
+                        .scrollIndicators(.visible).frame(height: rowHeight * 3 + 8)
+                        .onChange(of: selectedIndex) { _, index in
+                            if suggestions.indices.contains(index) { proxy.scrollTo(suggestions[index].id) }
                         }
-                        Text("↑↓ choose · Tab or Return insert · Esc dismiss").font(.system(size: 10)).foregroundStyle(.secondary).padding(.horizontal, 9).padding(.top, 3)
-                    }.padding(8).frame(width: 330).background(Theme.panel, in: RoundedRectangle(cornerRadius: 10))
-                        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Theme.border))
-                        .shadow(color: .black.opacity(0.25), radius: 12, y: 4)
-                        .alignmentGuide(.top) { $0[.bottom] + 8 }
                 }
-            }.zIndex(10)
+            }
+            Text("↑↓ choose · Tab or Return insert · Esc dismiss").font(.system(size: 10)).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true).padding(.horizontal, 9)
+        }.padding(8).frame(maxWidth: 390, alignment: .leading)
+            .background(Theme.background, in: RoundedRectangle(cornerRadius: 10))
+            .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Theme.border))
+    }
+    private var rows: some View {
+        VStack(spacing: 4) {
+            ForEach(Array(suggestions.enumerated()), id: \.element.id) { index, identity in
+                Button { choose(identity) } label: {
+                    HStack(spacing: 10) {
+                        Text(String(identity.name.prefix(1)).uppercased()).font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(identity.provider.tint).frame(width: 28, height: 28)
+                            .background(identity.provider.tint.opacity(0.13), in: Circle())
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(identity.name).font(.system(size: 12, weight: .medium)).foregroundStyle(.primary)
+                            Text(identity.provider.name).font(.system(size: 10)).foregroundStyle(.secondary)
+                        }.lineLimit(1).frame(maxWidth: .infinity, alignment: .leading)
+                        Text("@\(identity.mention)").font(.system(size: 11)).foregroundStyle(Theme.accent)
+                            .lineLimit(1).truncationMode(.middle).frame(maxWidth: 120, alignment: .trailing)
+                    }.padding(.horizontal, 8).frame(height: rowHeight).frame(maxWidth: .infinity, alignment: .leading)
+                        .background(index == selectedIndex ? Theme.accent.opacity(0.14) : .clear, in: RoundedRectangle(cornerRadius: 6))
+                }.buttonStyle(.plain).focusable(false).onHover { hovering in if hovering { highlight(index) } }
+                    .accessibilityLabel("Mention \(identity.name), \(identity.provider.name), @\(identity.mention)")
+                    .help("\(identity.name) · \(identity.provider.name) · @\(identity.mention)").id(identity.id)
+            }
+        }
     }
 }
 
