@@ -6,7 +6,7 @@ services:
     pull_policy: always
     environment:
       DEVELOPMENT: 'false'
-      ALLOW_SIGNUP: 'false'
+      ALLOW_SIGNUP: ${ALLOW_SIGNUP:-false}
       PUBLIC_ORIGIN: ${PUBLIC_ORIGIN:?Set the public HTTPS origin}
   frontend:
     build: !reset null

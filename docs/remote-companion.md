@@ -92,7 +92,7 @@ CONDUCTOR_IMAGE_PREFIX=ghcr.io/darthjonathan/the-agent-condutor
 CONDUCTOR_IMAGE_TAG=sha-REPLACE_WITH_THE_PUBLISHED_FULL_COMMIT
 ```
 
-The Compose override removes frontend/backend build definitions, requires an explicit published tag, and forces production mode with public signup disabled. Use a current Docker Compose version with [`!reset` support](https://docs.docker.com/reference/compose-file/merge/#reset-value). Keep the repository's Compose and Caddy files on the server; the application source is not compiled there.
+The Compose override removes frontend/backend build definitions, requires an explicit published tag, and forces production mode. Public signup is disabled by default and follows `ALLOW_SIGNUP` from the server's environment. Use a current Docker Compose version with [`!reset` support](https://docs.docker.com/reference/compose-file/merge/#reset-value). Keep the repository's Compose and Caddy files on the server; the application source is not compiled there.
 
 New [GHCR packages are private by default](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry#pushing-container-images). For private images, authenticate on the server using a GitHub personal access token (classic) with `read:packages` and permission to those packages; use `docker login ghcr.io --username YOUR_GITHUB_USER --password-stdin`. Public packages can be pulled without login. Do not place this token in Compose, image build arguments or the repository. GitHub package settings control visibility and repository access.
 
@@ -105,7 +105,21 @@ docker compose --profile https up -d --no-build
 
 The `COMPOSE_FILE` setting also makes the account-provisioning command below use the published backend image. Changing `CONDUCTOR_IMAGE_TAG` to an earlier published version and running these commands again rolls back the application containers; PostgreSQL data remains in its volume. This workflow publishes containers to GHCR; it does not connect to or restart a hosted server automatically.
 
-Production has no open signup or default account. Provision an account without placing its password in argv or committing it:
+### Production registration
+
+Production signup is an explicit opt-in, independent of development mode. To let users create their own accounts, set these values in the server's private `.env`:
+
+```dotenv
+PUBLIC_ORIGIN=https://your.domain
+DEVELOPMENT=false
+ALLOW_SIGNUP=true
+```
+
+After deploying an image containing this change, recreate the backend with `docker compose up -d --no-build backend`. The website reads `GET /api/v1/auth/options` and shows **Create an account** when `signup_enabled` is true. Reload an already open login page after changing the setting.
+
+Registration uses `POST /api/v1/auth/register` with JSON containing `email` and `password`; a password must contain 12–72 bytes. Successful registration signs the user in with the same secure session cookie and CSRF protection as login. HTTPS, session-secret validation, password hashing and signup rate limits remain enforced. Only the new account's paired devices and shared chats are accessible to it.
+
+Set `ALLOW_SIGNUP=false` (or omit it) to disable registration; the endpoint returns HTTP 403 and the signup button is hidden. Existing accounts can still sign in. Owner-created accounts remain available whether signup is enabled or disabled. There is no default account. Provision one without placing its password in argv or committing it:
 
 ```sh
 read -r CONDUCTOR_USER_EMAIL
@@ -133,3 +147,5 @@ target/remote-store-smoke-test
 Go tests create and drop their own PostgreSQL schema. The end-to-end fixture verifies the Svelte HTTP proxy, append events, engine acknowledgements, native session continuation, duplicate IDs, restart, user questions, approvals, cancellation and revocation with a fake CLI. The Docker build uses a pinned patched Go toolchain; vulnerability checks inspect that runtime rather than an older Go installation on the Mac.
 
 `scripts/remote-web-smoke.mjs` exercises the actual web interface using a disposable account, simulated device and headless Playwright browser. It verifies tables, sanitization, @ autocomplete, model/effort controls, multi-select answers, streaming updates, logout and mobile width, then saves screenshots under `target/remote-web/`. Set `CONDUCTOR_PLAYWRIGHT_MODULES` to a directory containing an installed Playwright package and, if needed, `CONDUCTOR_CHROMIUM_EXECUTABLE` to an existing compatible headless Chromium executable before running it with Node. It does not use provider accounts or desktop data.
+
+For the signup UI specifically, build the frontend and run `node scripts/signup-web-smoke.mjs`. This starts an isolated frontend on an ephemeral loopback port and supplies controlled API responses, without creating accounts or touching the running app. It checks enabled/disabled signup, form errors and retry, pending-state controls, automatic sign-in and return to sign-in after logout, and saves `target/remote-web/signup.png`. Real production registration, hashed passwords, session cookies and CSRF checks are covered separately by the backend integration tests.

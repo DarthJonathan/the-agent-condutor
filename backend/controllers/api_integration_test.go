@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"golang.org/x/crypto/bcrypt"
 	"gorm.io/gorm"
 	"net/http"
 	"net/http/httptest"
@@ -91,6 +92,56 @@ func enroll(t *testing.T, a *API, user string) (*dao.Device, string, string) {
 		t.Fatal(err)
 	}
 	return d, token, workspace
+}
+
+func TestProductionSignupHonorsOptInAndCreatesSecureSession(t *testing.T) {
+	a, h := fixture(t)
+	if a.Config.Development {
+		t.Fatal("signup fixture must use production mode")
+	}
+	email, password := service.ID()+"@example.test", "signup-password-1234"
+	body := map[string]string{"email": email, "password": password}
+	headers := map[string]string{"Origin": a.Config.PublicOrigin}
+	if object(t, call(t, h, "GET", "/api/v1/auth/options", nil, nil, nil), 200)["signup_enabled"] != false {
+		t.Fatal("signup advertised when disabled")
+	}
+	object(t, call(t, h, "POST", "/api/v1/auth/register", body, nil, headers), 403)
+	var count int64
+	if err := a.Auth.DB.Model(&dao.User{}).Where("email = ?", email).Count(&count).Error; err != nil || count != 0 {
+		t.Fatal("disabled signup created an account", err)
+	}
+	a.Config.AllowSignup = true
+	if object(t, call(t, h, "GET", "/api/v1/auth/options", nil, nil, nil), 200)["signup_enabled"] != true {
+		t.Fatal("enabled signup not advertised")
+	}
+	object(t, call(t, h, "POST", "/api/v1/auth/register", body, nil, map[string]string{"Origin": "https://attacker.test"}), 403)
+	object(t, call(t, h, "POST", "/api/v1/auth/register", map[string]string{"email": email, "password": "short"}, nil, headers), 400)
+	w := call(t, h, "POST", "/api/v1/auth/register", body, nil, headers)
+	data := object(t, w, 200)
+	cookies := w.Result().Cookies()
+	if len(cookies) != 1 {
+		t.Fatal("signup did not establish a session")
+	}
+	cookie := cookies[0]
+	if cookie.Name != "__Host-conductor-session" || !cookie.HttpOnly || !cookie.Secure || cookie.SameSite != http.SameSiteStrictMode || cookie.Path != "/" || cookie.Domain != "" {
+		t.Fatal("unsafe signup session cookie")
+	}
+	if strings.Contains(w.Body.String(), password) || strings.Contains(w.Body.String(), "password_hash") || strings.Contains(w.Body.String(), cookie.Value) {
+		t.Fatal("signup response exposed credentials")
+	}
+	var user dao.User
+	if err := a.Auth.DB.Where("email = ?", email).First(&user).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(password)); err != nil {
+		t.Fatal("signup password not correctly hashed", err)
+	}
+	object(t, call(t, h, "GET", "/api/v1/auth/session", nil, cookie, nil), 200)
+	object(t, call(t, h, "POST", "/api/v1/auth/logout", map[string]any{}, cookie, headers), 403)
+	headers["X-CSRF-Token"] = data["csrf"].(string)
+	object(t, call(t, h, "POST", "/api/v1/auth/logout", map[string]any{}, cookie, headers), 200)
+	a.Config.AllowSignup = false
+	object(t, call(t, h, "POST", "/api/v1/auth/register", body, nil, headers), 403)
 }
 
 func TestBrowserAuthenticationCSRFAndLogout(t *testing.T) {

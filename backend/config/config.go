@@ -31,9 +31,6 @@ func (c Config) Validate() error {
 	if c.DatabaseURL == "" {
 		return errors.New("DATABASE_URL is required")
 	}
-	if c.AllowSignup && !c.Development {
-		return errors.New("public signup is disabled outside development; provision accounts with --create-user")
-	}
 	return nil
 }
 func env(key, fallback string) string {

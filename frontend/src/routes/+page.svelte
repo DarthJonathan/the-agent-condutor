@@ -20,7 +20,7 @@
     const response = await fetch(`/api/v1${path}`, { method, credentials: 'same-origin', headers: { 'content-type': 'application/json', ...(method === 'GET' ? {} : { 'x-csrf-token': csrf }) }, body: body === undefined ? undefined : JSON.stringify(body) });
     const data = await response.json(); if (!response.ok) { if (response.status === 401 && !path.includes('/auth/login')) { user = null; stream?.close(); } throw new Error(data.error || `Request failed (${response.status})`); } return data;
   }
-  async function login() { busy = true; error = ''; try { const data = await api(`/auth/${signup ? 'register' : 'login'}`, 'POST', { email, password }); user = data.user; csrf = data.csrf; password = ''; await loadDevices(); } catch(e) { error = String((e as Error).message); } finally { busy = false; } }
+  async function login() { busy = true; error = ''; try { const data = await api(`/auth/${signup ? 'register' : 'login'}`, 'POST', { email, password }); user = data.user; csrf = data.csrf; password = ''; signup = false; await loadDevices(); } catch(e) { error = String((e as Error).message); } finally { busy = false; } }
   async function logout() { try { await api('/auth/logout', 'POST', {}); } finally { stream?.close(); user = null; deviceID = ''; runs = {}; csrf = ''; } }
   async function loadDevices() { devices = (await api('/devices')).devices; if (!deviceID && devices.length) chooseDevice(devices[0].id); }
   function metadata(data: any) {
@@ -75,10 +75,10 @@
 
 <svelte:head><title>Conductor · Remote workspace</title><meta name="description" content="Your agent coworkers, wherever you are."/><link rel="icon" type="image/png" href="/icon.png"/></svelte:head>
 {#if !user}
-  <main class="login"><div class="login-card"><img class="app-icon" src="/icon.png" alt="Conductor"/><h1>Your workspace,<br/>wherever you are.</h1><p>Connect to Conductor on your Mac and pick up the conversation.</p>
-    <form onsubmit={e => { e.preventDefault(); void login(); }}><label>Email<input type="email" bind:value={email} autocomplete="username" required/></label><label>Password<input type="password" bind:value={password} autocomplete={signup ? 'new-password' : 'current-password'} minlength={signup ? 12 : undefined} required/></label>
-      {#if error}<div class="error" role="alert">{error}</div>{/if}<button class="primary" disabled={busy}>{busy ? 'Signing in…' : signup ? 'Create account' : 'Sign in'}</button>
-    </form>{#if allowSignup}<button class="quiet" onclick={() => { signup = !signup; error = ''; }}>{signup ? 'Back to sign in' : 'Create a development account'}</button>{/if}<small>{allowSignup ? 'Create an account, then pair your Mac from its Remote screen.' : 'Use an account provisioned by the server owner.'}</small>
+  <main class="login"><div class="login-card"><img class="app-icon" src="/icon.png" alt="Conductor"/><h1>{#if signup}Create your account{:else}Your workspace,<br/>wherever you are.{/if}</h1><p>{signup ? 'Use the same account on the web and in Conductor on your Mac.' : 'Connect to Conductor on your Mac and pick up the conversation.'}</p>
+    <form onsubmit={e => { e.preventDefault(); void login(); }}><label>Email<input type="email" bind:value={email} autocomplete="username" required disabled={busy}/></label><label>Password<input type="password" bind:value={password} autocomplete={signup ? 'new-password' : 'current-password'} minlength={signup ? 12 : undefined} required disabled={busy}/></label>
+      {#if error}<div class="error" role="alert">{error}</div>{/if}<button class="primary" disabled={busy}>{busy ? signup ? 'Creating account…' : 'Signing in…' : signup ? 'Create account' : 'Sign in'}</button>
+    </form>{#if allowSignup}<button class="quiet" disabled={busy} onclick={() => { signup = !signup; error = ''; }}>{signup ? 'Back to sign in' : 'Create an account'}</button>{/if}<small>{allowSignup ? 'Create an account, then pair your Mac from its Remote screen.' : 'Use an account provisioned by the server owner.'}</small>
   </div></main>
 {:else}
   <div class="app">
