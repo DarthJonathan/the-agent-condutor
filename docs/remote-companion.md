@@ -26,6 +26,16 @@ Local provider credentials, executable configuration, environment variables, CLI
 
 Remote history is a bounded copy: recent 32 messages plus pending forms where space permits, up to 96 KiB per response, 20 file diffs and 16 check results. Larger histories show an explicit notice to use the complete transcript on the Mac. The dashboard loads small previews for all sessions, then streams full content for the selected chat. There is no separate unrestricted shell-command API; remote approvals reference an existing pending request on the Mac.
 
+## Installable web app and offline access
+
+The frontend includes a web app manifest, app icons and a SvelteKit service worker. Visit the hosted HTTPS website once while online to install the public app shell and assets. Use **Install app** in a supported browser, or Safari’s **Share → Add to Home Screen** on iPhone/iPad. Localhost also works for development; a production build is required to test service-worker caching.
+
+The shell loads without a connection after its first successful cache installation. By default, no account or chat data is persisted. Enable **Save chats offline** on a trusted browser/device to retain previously opened conversations, rendered Markdown, coworkers and change summaries. Copies are limited to three recently visited computers, twenty chats per computer, five MiB total and seven days. Conversations that were never opened may have only a title/preview; full histories still live on the Mac. Browser storage may be evicted by the operating system.
+
+An **Offline · read-only** banner identifies cached content and its save time. Messages, questions, approvals, configuration changes and cancellation require a live connection; commands are never queued for later execution. Reconnection checks the server session before restoring live access. A rejected session, a different account, sign-out or computer disconnection clears the local copy. **Clear offline copy** removes it immediately; server sign-out requires a connection. Removed sharing is reconciled when the browser next connects.
+
+The service worker caches only public HTML/assets, never `/api/` responses, SSE or mutation requests. Offline chat copies use IndexedDB and contain account ID/email and bounded content, without passwords, CSRF tokens, session cookies or provider credentials. They are readable by someone with access to this browser profile and are not end-to-end encrypted. The server continues to enforce ownership and cookie/CSRF protection for every online request.
+
 ## Protocol and trust
 
 - Browser: same-origin HttpOnly cookie; CSRF header and Origin check on mutations; SSE for events, JSON POST for commands. No tokens in browser storage or URLs.
@@ -149,3 +159,5 @@ Go tests create and drop their own PostgreSQL schema. The end-to-end fixture ver
 `scripts/remote-web-smoke.mjs` exercises the actual web interface using a disposable account, simulated device and headless Playwright browser. It verifies tables, sanitization, @ autocomplete, model/effort controls, multi-select answers, streaming updates, logout and mobile width, then saves screenshots under `target/remote-web/`. Set `CONDUCTOR_PLAYWRIGHT_MODULES` to a directory containing an installed Playwright package and, if needed, `CONDUCTOR_CHROMIUM_EXECUTABLE` to an existing compatible headless Chromium executable before running it with Node. It does not use provider accounts or desktop data.
 
 For the signup UI specifically, build the frontend and run `node scripts/signup-web-smoke.mjs`. This starts an isolated frontend on an ephemeral loopback port and supplies controlled API responses, without creating accounts or touching the running app. It checks enabled/disabled signup, form errors and retry, pending-state controls, automatic sign-in and return to sign-in after logout, and saves `target/remote-web/signup.png`. Real production registration, hashed passwords, session cookies and CSRF checks are covered separately by the backend integration tests.
+
+For the PWA, build the frontend and run `node scripts/pwa-web-smoke.mjs` using the same Playwright environment variables. Its disposable HTTP relay and fresh headless browser exercise the actual service worker, installation metadata/icon sizes, offline reloads, opt-in chat copies, read-only questions/approvals, reconnection, account changes, expired sessions, sign-out and clearing. It does not access provider accounts or the running app, and saves `target/remote-web/pwa-offline.png`.

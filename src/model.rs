@@ -67,7 +67,7 @@ impl Provider {
             Self::Codex => "OpenAI Codex · local CLI",
             Self::Antigravity => "Google Antigravity · local CLI",
             Self::Qoder => "Qoder · local CLI",
-            Self::DeepSeek => "DeepSeek · Claude Code or API",
+            Self::DeepSeek => "DeepSeek · native harness, Claude Code or API",
             Self::Kiro => "Kiro · local CLI",
         }
     }
@@ -90,7 +90,7 @@ impl Provider {
             Self::Antigravity => "https://www.antigravity.google/docs/cli/headless/",
             Self::Qoder => "https://docs.qoder.com/cli/run-in-scripts",
             Self::DeepSeek => {
-                "https://api-docs.deepseek.com/quick_start/agent_integrations/claude_code/"
+                "https://github.com/deepseek-ai/deepseek-harness"
             }
             Self::Kiro => "https://kiro.dev/docs/cli/headless/",
         }
@@ -171,6 +171,7 @@ pub struct Settings {
     pub timeout_seconds: u64,
     pub deepseek_base_url: String,
     pub deepseek_mode: DeepSeekMode,
+    pub deepseek_harness_executable: String,
     pub deepseek_use_cli_config: bool,
     pub claude_backend: ClaudeBackend,
     pub claude_base_url: String,
@@ -191,6 +192,7 @@ pub enum ClaudeBackend {
 pub enum DeepSeekMode {
     #[default]
     ClaudeCode,
+    NativeHarness,
     DirectApi,
 }
 
@@ -223,6 +225,7 @@ impl Default for Settings {
             timeout_seconds: 900,
             deepseek_base_url: "https://api.deepseek.com".into(),
             deepseek_mode: DeepSeekMode::ClaudeCode,
+            deepseek_harness_executable: String::new(),
             deepseek_use_cli_config: false,
             claude_backend: ClaudeBackend::Inherit,
             claude_base_url: String::new(),

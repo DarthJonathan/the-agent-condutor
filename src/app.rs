@@ -1045,7 +1045,7 @@ impl ConductorApp {
                     ui.add_space(12.0);
                     if config.provider == Provider::DeepSeek {
                         ui.horizontal(|ui| {
-                            for (mode, label) in [(DeepSeekMode::ClaudeCode, "Claude Code · agent"), (DeepSeekMode::DirectApi, "Direct API · text")] {
+                            for (mode, label) in [(DeepSeekMode::ClaudeCode, "Claude Code · agent"), (DeepSeekMode::NativeHarness, "DeepSeek Harness · agent"), (DeepSeekMode::DirectApi, "Direct API · text")] {
                                 if ui.selectable_value(&mut self.settings.deepseek_mode, mode, label).changed() { self.dirty = true; self.agents.insert(Provider::DeepSeek, Availability::Checking); }
                             }
                         });
@@ -1058,7 +1058,7 @@ impl ConductorApp {
                         }
                         ui.columns(2, |cols| {
                             field_label(&mut cols[0], "SESSION API KEY");
-                            cols[0].add_enabled_ui(self.settings.deepseek_mode == DeepSeekMode::DirectApi || !self.settings.deepseek_use_cli_config, |ui| {
+                            cols[0].add_enabled_ui(self.settings.deepseek_mode != DeepSeekMode::ClaudeCode || !self.settings.deepseek_use_cli_config, |ui| {
                                 if ui.add_sized([ui.available_width(), 31.0], egui::TextEdit::singleline(&mut self.session_key).password(true).hint_text("Or use DEEPSEEK_API_KEY")).changed() { self.agents.insert(Provider::DeepSeek, Availability::Checking); }
                             });
                             field_label(&mut cols[1], "MODEL");
@@ -1078,6 +1078,11 @@ impl ConductorApp {
                             ui.collapsing("Additional CLI arguments", |ui| {
                                 if ui.add_sized([ui.available_width(), 31.0], egui::TextEdit::singleline(&mut config.extra_args).font(FontId::monospace(11.0))).changed() { self.dirty = true; }
                             });
+                        } else if self.settings.deepseek_mode == DeepSeekMode::NativeHarness {
+                            field_label(ui, "DEEPSEEK HARNESS EXECUTABLE");
+                            if ui.add_sized([ui.available_width(), 31.0], egui::TextEdit::singleline(&mut self.settings.deepseek_harness_executable).hint_text("Auto-detect dsh")).changed() { self.dirty = true; self.agents.insert(Provider::DeepSeek, Availability::Checking); }
+                            if ui.checkbox(&mut config.allow_edits, "Allow workspace file edits").changed() { self.dirty = true; }
+                            ui.label(RichText::new("Native dsh headless sessions. Optional key overrides managed DeepSeek credentials. Additional CLI arguments must be empty.").size(10.5).color(MUTED));
                         } else {
                             ui.label(RichText::new("The direct API receives text only and has no workspace tools.").size(10.5).color(MUTED));
                         }

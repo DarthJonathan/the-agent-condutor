@@ -7,7 +7,8 @@ import { mkdir } from 'node:fs/promises';
 import net from 'node:net';
 import path from 'node:path';
 
-const modules = process.env.CONDUCTOR_PLAYWRIGHT_MODULES || path.join(process.env.HOME, '.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules');
+const localModules = path.resolve('frontend/node_modules');
+const modules = process.env.CONDUCTOR_PLAYWRIGHT_MODULES || (existsSync(path.join(localModules, 'playwright/package.json')) ? localModules : path.join(process.env.HOME, '.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules'));
 const { chromium } = createRequire(path.join(modules, 'playwright/package.json'))('playwright');
 const probe = net.createServer();
 await new Promise(resolve => probe.listen(0, '127.0.0.1', resolve));

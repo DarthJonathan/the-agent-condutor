@@ -56,7 +56,7 @@ cat > "$conductor_bundle/Contents/Info.plist" <<'PLIST'
   <key>CFBundleExecutable</key><string>agent-conductor</string>
   <key>CFBundleIconFile</key><string>AppIcon.icns</string>
   <key>CFBundleIdentifier</key><string>dev.agentconductor.desktop</string>
-  <key>CFBundleVersion</key><string>10</string>
+  <key>CFBundleVersion</key><string>11</string>
   <key>CFBundleShortVersionString</key><string>0.2.1</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>NSHighResolutionCapable</key><true/>

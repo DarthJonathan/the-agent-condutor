@@ -1,5 +1,5 @@
 <script lang="ts">
-  let { request, send }: { request: any; send: (answers: any[]) => Promise<void> } = $props();
+  let { request, send, disabled = false }: { request: any; send: (answers: any[]) => Promise<void>; disabled?: boolean } = $props();
   let answers = $state<Record<string, string[]>>({}); let custom = $state<Record<string, string>>({}); let skipped = $state<Record<string, boolean>>({}); let pending = $state(false);
   function choose(question: any, id: string, checked: boolean) {
     const current = answers[question.id] || [];
@@ -9,13 +9,13 @@
 </script>
 <form onsubmit={(e) => { e.preventDefault(); void submit(); }}>
   {#each request.questions as question}
-    <fieldset disabled={pending}><legend>{question.question}</legend>
+    <fieldset disabled={pending || disabled}><legend>{question.question}</legend>
       {#each question.options || [] as option}<label><input type={question.multi_select ? 'checkbox' : 'radio'} name={question.id} value={option.id} checked={(answers[question.id] || []).includes(option.id)} disabled={skipped[question.id]} onchange={e => choose(question, option.id, e.currentTarget.checked)}/><span>{option.label}<small>{option.description || ''}</small></span></label>{/each}
       <textarea bind:value={custom[question.id]} placeholder="Your answer or additional details…" aria-label="Custom answer"></textarea>
       <label class="skip"><input type="checkbox" bind:checked={skipped[question.id]}/>Skip this question</label>
     </fieldset>
   {/each}
-  <button disabled={pending || request.questions.some((q: any) => !skipped[q.id] && !answers[q.id]?.length && !custom[q.id]?.trim())}>{pending ? 'Sending…' : 'Send answers'}</button>
+  <button disabled={pending || disabled || request.questions.some((q: any) => !skipped[q.id] && !answers[q.id]?.length && !custom[q.id]?.trim())}>{pending ? 'Sending…' : 'Send answers'}</button>
 </form>
 <style>
   fieldset { border: 0; margin: 18px 0; padding: 0; } legend { font-weight: 600; margin-bottom: 12px; }

@@ -208,6 +208,9 @@ pub fn prepare_with_keys(
         if extra_args.iter().any(|arg| arg.contains('\0')) {
             bail!("CLI arguments cannot contain a NUL byte.");
         }
+        if config.provider == Provider::DeepSeek && settings.deepseek_mode == DeepSeekMode::NativeHarness && !extra_args.is_empty() {
+            bail!("Clear Additional arguments for native DeepSeek Harness. Conductor manages its profile, settings, JSON output and session arguments.");
+        }
         if has_model_override(config.provider, &extra_args) {
             bail!(
                 "Use the model fields in Connections or the chat's model picker instead of additional model arguments."
@@ -271,7 +274,7 @@ pub fn prepare_with_keys(
                 inspection.snapshot.backend
             );
         }
-        if deepseek_key.is_none() && !use_cli_config {
+        if deepseek_key.is_none() && !use_cli_config && settings.deepseek_mode != DeepSeekMode::NativeHarness {
             bail!("Set DEEPSEEK_API_KEY or enter a session key in Connections.");
         }
         if !use_cli_config {
@@ -383,6 +386,9 @@ pub fn prepare_with_keys(
                         .hash(&mut scope);
                 } else {
                     settings.deepseek_base_url.hash(&mut scope);
+                    if settings.deepseek_mode == DeepSeekMode::NativeHarness {
+                        std::env::var_os("DSH_HOME").hash(&mut scope);
+                    }
                 }
             }
             Provider::Kiro => {
@@ -555,7 +561,7 @@ async fn probe(
         }
         let key_available = session_has_key
             || std::env::var("DEEPSEEK_API_KEY").is_ok_and(|key| !key.trim().is_empty());
-        if !key_available && !(mode == DeepSeekMode::ClaudeCode && use_cli_config) {
+        if !key_available && !(mode == DeepSeekMode::ClaudeCode && use_cli_config) && mode != DeepSeekMode::NativeHarness {
             return Availability::Missing("Add a DeepSeek API key, or select your existing DeepSeek configuration in Claude Code. Then click Save & check.".into());
         }
         if mode == DeepSeekMode::DirectApi {
@@ -564,7 +570,7 @@ async fn probe(
                 detail: "API key available · text reasoning, no file or shell tools".into(),
             };
         }
-        if !use_cli_config
+        if !use_cli_config && mode == DeepSeekMode::ClaudeCode
             && let Err(error) = inspection.override_for(
                 ClaudeBackend::DeepSeek,
                 &settings.deepseek_base_url,
@@ -574,6 +580,22 @@ async fn probe(
         {
             return Availability::Missing(error.to_string());
         }
+    }
+    if config.provider == Provider::DeepSeek && mode == DeepSeekMode::NativeHarness {
+        if let Err(error) = validate_api_url(&settings.deepseek_base_url) { return Availability::Missing(error.to_string()); }
+        let candidate = if settings.deepseek_harness_executable.trim().is_empty() { "dsh" } else { settings.deepseek_harness_executable.trim() };
+        let Some(path) = resolve_executable(candidate) else { return Availability::Missing("Install DeepSeek Harness (dsh), or choose its executable. Then click Save & check.".into()); };
+        let Ok(probe_home) = tempfile::tempdir() else { return Availability::Missing("Unable to create a private harness compatibility check.".into()); };
+        let mut command = Command::new(&path);
+        // Check machine-readable session flags in a disposable profile, never the user's home/config.
+        command.args(["--profile", "headless", "--help"]).env("DSH_HOME", probe_home.path()).current_dir(probe_home.path()).env("PATH", executable_search_path()).stdin(Stdio::null()).kill_on_drop(true);
+        hide_console(&mut command);
+        return match timeout(Duration::from_secs(8), command.output()).await {
+            Ok(Ok(output)) if output.status.success() && String::from_utf8_lossy(&output.stdout).contains("--json") && String::from_utf8_lossy(&output.stdout).contains("--session-id") => Availability::Ready {
+                executable: Some(path), detail: "Native DeepSeek Harness detected · headless JSON sessions. Uses DEEPSEEK_API_KEY, an optional session key, or dsh’s managed credentials; access is checked when a run starts.".into()
+            },
+            _ => Availability::Incompatible("This executable does not expose DeepSeek Harness headless --json and --session-id. Update dsh and check again.".into())
+        };
     }
     let interface_provider = if config.provider == Provider::DeepSeek {
         Provider::Claude
@@ -1049,6 +1071,25 @@ fn hide_console(command: &mut Command) {
     let _ = command;
 }
 
+fn deepseek_harness_patch(plan: &Plan, task: &Task) -> Result<tempfile::NamedTempFile> {
+    let base = plan.deepseek_base_url.trim_end_matches('/');
+    let base = if base.ends_with("/anthropic") || base.ends_with("/v1") { base.to_owned() } else { format!("{base}/anthropic") };
+    let mut model = serde_json::json!({"provider":"deepseek-official", "model": if task.config.model.is_empty() { "deepseek-flash" } else { task.config.model.as_str() }});
+    if task.config.effort != Effort::Default {
+        model["reasoningEffort"] = serde_json::json!(if task.config.effort == Effort::None { "off" } else { task.config.effort.value() });
+    }
+    let patch = serde_json::json!([
+        {"id":"agent-default-model", "config":model},
+        {"id":"llm-deepseek", "config":{"baseURL":base, "apiKeyEnv":"DEEPSEEK_API_KEY"}},
+        {"id":"sandbox-policy", "config":{"mode": if task.config.allow_edits { "workspace-write" } else { "read-only" }, "workspaceRoot":plan.workspace}},
+        {"id":"approval", "config":{"policy":"never"}}
+    ]);
+    // JSON is valid YAML; no credential is written to this per-invocation overlay.
+    let mut file = tempfile::Builder::new().prefix("conductor-dsh-").suffix(".yaml").tempfile()?;
+    serde_json::to_writer(&mut file, &patch)?;
+    Ok(file)
+}
+
 #[cfg(test)]
 async fn run_cli(plan: &Plan, task: &Task, prompt: &str, emitter: &Emitter) -> Result<String> {
     Ok(run_cli_result(plan, task, prompt, emitter).await?.0)
@@ -1064,9 +1105,16 @@ async fn run_cli_result(
         .executable
         .as_ref()
         .context("CLI executable is missing")?;
-    let (args, input) = cli_arguments(task, prompt);
+    let native_harness = task.config.provider == Provider::DeepSeek && plan.deepseek_mode == DeepSeekMode::NativeHarness;
+    let _harness_patch = if native_harness { Some(deepseek_harness_patch(plan, task)?) } else { None };
+    let (args, input) = if let Some(patch) = &_harness_patch {
+        let mut args = vec!["--profile".into(), "headless".into(), "--patch".into(), patch.path().to_string_lossy().into_owned(), "--json".into()];
+        if let Some(session) = &task.resume_session { args.extend(["--session-id".into(), session.clone()]); }
+        args.push("-".into());
+        (args, Some(prompt.into()))
+    } else { cli_arguments(task, prompt) };
     let mut command = Command::new(executable);
-    if matches!(task.config.provider, Provider::Claude | Provider::DeepSeek)
+    if !native_harness && matches!(task.config.provider, Provider::Claude | Provider::DeepSeek)
         && task.config.effort != Effort::Default
     {
         command.env("CLAUDE_CODE_EFFORT_LEVEL", task.config.effort.value());
@@ -1074,7 +1122,10 @@ async fn run_cli_result(
     if task.config.provider == Provider::Kiro && !plan.kiro_key.is_empty() {
         command.env("KIRO_API_KEY", &plan.kiro_key);
     }
-    if matches!(task.config.provider, Provider::Claude | Provider::DeepSeek) {
+    if native_harness {
+        if let Some(key) = &plan.deepseek_key { command.env("DEEPSEEK_API_KEY", key); }
+        command.env("DSH_PERMISSION_MODE", if task.config.allow_edits { "workspace-write" } else { "read-only" });
+    } else if matches!(task.config.provider, Provider::Claude | Provider::DeepSeek) {
         command.env(
             "CLAUDE_CONFIG_DIR",
             claude_config::config_directory(&plan.claude_config_dir),
@@ -1135,7 +1186,7 @@ async fn run_cli_result(
         Ok::<_, anyhow::Error>(())
     };
     let (decoder, diagnostics, status, ()) = tokio::try_join!(
-        read_stdout(stdout, plan.run_id, task.config.provider, emitter),
+        read_stdout(stdout, plan.run_id, task.config.provider, emitter, native_harness),
         read_stderr(stderr, plan.run_id, task.config.provider, emitter),
         async {
             guard
@@ -1179,9 +1230,10 @@ async fn read_stdout(
     run_id: Uuid,
     provider: Provider,
     emitter: &Emitter,
+    native_harness: bool,
 ) -> Result<Decoder> {
     let mut reader = BufReader::new(stdout);
-    let wire_provider = if provider == Provider::DeepSeek {
+    let wire_provider = if provider == Provider::DeepSeek && !native_harness {
         Provider::Claude
     } else {
         provider
@@ -1343,6 +1395,70 @@ async fn run_api(plan: &Plan, task: &Task, prompt: &str, emitter: &Emitter) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn native_harness_settings_do_not_reuse_claude_sessions_or_accept_launcher_overrides() {
+        let (_area, plan) = fixture("exit 0", Provider::DeepSeek);
+        let mut settings = Settings { workspace: plan.workspace.display().to_string(), deepseek_mode: DeepSeekMode::NativeHarness, ..Settings::default() };
+        settings.agents = vec![plan.tasks[0].config.clone()];
+        settings.agents[0].selected = true;
+        let available = HashMap::from([(Provider::DeepSeek, Availability::Ready { executable: plan.tasks[0].executable.clone(), detail: "Fixture".into() })]);
+        let (_, native) = prepare(&settings, &available, "task", "").unwrap();
+        settings.deepseek_mode = DeepSeekMode::ClaudeCode;
+        let (_, claude) = prepare(&settings, &available, "task", "fixture-key").unwrap();
+        assert_ne!(native.session_scope, claude.session_scope);
+        settings.deepseek_mode = DeepSeekMode::NativeHarness;
+        settings.agents[0].effort = Effort::None;
+        assert!(prepare(&settings, &available, "task", "").is_ok());
+        settings.agents[0].extra_args = r#"["--patch", "override.yaml"]"#.into();
+        let error = prepare(&settings, &available, "task", "").err().unwrap().to_string();
+        assert!(error.contains("Clear Additional arguments"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_harness_invocation_resumes_exact_session_and_cleans_private_overlay() {
+        let script = r#"
+test "$1" = --profile && test "$2" = headless && test "$3" = --patch && test "$5" = --json || exit 9
+cp "$4" harness-patch.json
+printf '%s' "$4" > overlay-path
+printf '%s' "$DEEPSEEK_API_KEY" > session-key
+printf '%s' "$DSH_PERMISSION_MODE" > permissions
+if [ "$6" = --session-id ]; then printf '%s' "$7" > resumed-session; fi
+cat > task-prompt
+printf '%s\n' '{"type":"session","sessionId":"session-native-fixture"}' '{"type":"text","text":"Step answer"}' '{"type":"status","phase":"turn_end","reason":"completed"}' '{"type":"final","text":"Native harness final"}'
+"#;
+        let (_dir, mut plan) = fixture(script, Provider::DeepSeek);
+        plan.deepseek_mode = DeepSeekMode::NativeHarness;
+        plan.deepseek_key = Some("fixture-key-never-serialized".into());
+        plan.deepseek_base_url = "https://api.deepseek.com".into();
+        plan.tasks[0].config.model = "deepseek-v4-pro".into();
+        plan.tasks[0].config.effort = Effort::Max;
+        let (emitter, _receiver) = emitter();
+        let (text, session) = run_cli_result(&plan, &plan.tasks[0], "initial task 🦀", &emitter).await.unwrap();
+        assert_eq!(text, "Native harness final");
+        assert_eq!(session.as_deref(), Some("session-native-fixture"));
+        let patch = std::fs::read_to_string(plan.workspace.join("harness-patch.json")).unwrap();
+        let rows: serde_json::Value = serde_json::from_str(&patch).unwrap();
+        assert_eq!(rows[0]["config"]["model"], "deepseek-v4-pro");
+        assert_eq!(rows[0]["config"]["reasoningEffort"], "max");
+        assert_eq!(rows[1]["config"]["baseURL"], "https://api.deepseek.com/anthropic");
+        assert_eq!(rows[2]["config"]["mode"], "read-only");
+        assert_eq!(rows[3]["config"]["policy"], "never");
+        assert!(!patch.contains("fixture-key-never-serialized"));
+        assert_eq!(std::fs::read_to_string(plan.workspace.join("task-prompt")).unwrap(), "initial task 🦀");
+        let path = std::fs::read_to_string(plan.workspace.join("overlay-path")).unwrap();
+        assert!(!Path::new(&path).exists(), "Private overlay must be removed after the process completes");
+        plan.tasks[0].resume_session = session;
+        plan.tasks[0].config.allow_edits = true;
+        plan.tasks[0].config.effort = Effort::None;
+        run_cli_result(&plan, &plan.tasks[0], "follow up", &emitter).await.unwrap();
+        assert_eq!(std::fs::read_to_string(plan.workspace.join("resumed-session")).unwrap(), "session-native-fixture");
+        assert_eq!(std::fs::read_to_string(plan.workspace.join("permissions")).unwrap(), "workspace-write");
+        let rows: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(plan.workspace.join("harness-patch.json")).unwrap()).unwrap();
+        assert_eq!(rows[0]["config"]["reasoningEffort"], "off");
+    }
 
     fn emitter() -> (Emitter, mpsc::Receiver<Message>) {
         let (sender, receiver) = mpsc::channel(1024);

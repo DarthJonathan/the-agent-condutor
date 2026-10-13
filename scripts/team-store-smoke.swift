@@ -20,6 +20,14 @@ enum TeamStoreSmoke {
         store.loaded = true; store.connected = true
         store.agents = Provider.allCases.map { AgentInfo(provider: $0, status: "ready", label: "Fixture", detail: "Fixture") }
         expect(store.effortOptions(.codex).contains(.max), "Codex Default must offer Max before the catalogue loads")
+        store.settings.deepseekMode = .nativeHarness
+        store.settings.deepseekHarnessExecutable = "/fixture/dsh"
+        expect(store.effortOptions(.deepseek).contains(.none), "Native DeepSeek Harness must offer Off independently of Claude Code")
+        let nativeEncoder = JSONEncoder(); nativeEncoder.keyEncodingStrategy = .convertToSnakeCase
+        let nativeDecoder = JSONDecoder(); nativeDecoder.keyDecodingStrategy = .convertFromSnakeCase
+        let nativeSettings = try nativeDecoder.decode(Settings.self, from: nativeEncoder.encode(store.settings))
+        expect(nativeSettings.deepseekMode == .nativeHarness && nativeSettings.deepseekHarnessExecutable == "/fixture/dsh", "Native harness mode and its separate executable must persist")
+        store.settings.deepseekMode = .claudeCode
         store.modelCatalogs = [ModelCatalog(provider: .codex, source: "Fixture", options: [
             ModelOption(id: "model-a", label: "Model A", effortLevels: [.low, .high]),
             ModelOption(id: "model-b", label: "Model B", effortLevels: [.low, .high]),

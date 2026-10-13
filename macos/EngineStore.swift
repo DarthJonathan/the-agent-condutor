@@ -500,7 +500,7 @@ final class EngineStore: ObservableObject {
         let chosen = model ?? (modelOverride(provider).isEmpty ? defaultModel(provider) : modelOverride(provider))
         if let levels = modelCatalogs.first(where: { $0.provider == provider })?.levels(for: chosen) { return levels }
         if provider == .deepseek || (provider == .claude && claudeUsesDeepSeek) {
-            return provider == .deepseek && settings.deepseekMode == .directApi ? [.none, .low, .high, .max] : [.low, .high, .max]
+            return provider == .deepseek && settings.deepseekMode != .claudeCode ? [.none, .low, .high, .max] : [.low, .high, .max]
         }
         if provider == .antigravity { return [.low, .medium, .high] }
         if provider == .codex { return [.low, .medium, .high, .xhigh, .max] }

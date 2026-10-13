@@ -28,6 +28,7 @@ pub struct Decoder {
     pub session_id: Option<String>,
     pub question_request: Option<crate::questions::QuestionRequest>,
     question_tool_id: Option<String>,
+    harness_usage: Usage,
 }
 
 impl Decoder {
@@ -45,6 +46,7 @@ impl Decoder {
             session_id: None,
             question_request: None,
             question_tool_id: None,
+            harness_usage: Usage { input_tokens: 0, output_tokens: 0, cost_usd: None },
         }
     }
 
@@ -445,6 +447,10 @@ impl Decoder {
     }
 
     fn deepseek(&mut self, v: &Value, out: &mut Vec<Update>) {
+        if !string(v, "type").is_empty() {
+            self.deepseek_harness(v, out);
+            return;
+        }
         if let Some(error) = v.get("error") {
             out.push(Update::Error(error_text(error)));
         }
@@ -465,6 +471,36 @@ impl Decoder {
             )));
         }
         usage(v.get("usage"), None, out);
+    }
+
+    fn deepseek_harness(&mut self, v: &Value, out: &mut Vec<Update>) {
+        match string(v, "type") {
+            "session" => {
+                if v["truncated"] == true { out.push(Update::Error("DeepSeek Harness returned a truncated session identity.".into())); }
+                else { session(v, "sessionId", out); }
+            }
+            "text" => out.push(Update::TextDelta(format!("{}\n\n", string(v, "text")))),
+            "thinking" => { self.claude_message_sequence += 1; self.reasoning_text(&format!("dsh:{}", self.claude_message_sequence), string(v, "text"), false, out); }
+            "tool_call" => out.push(Update::Log(LogKind::Tool, format!("{}: {}", string(v, "tool"), clip(&v["input"].to_string(), 8192)))),
+            "tool_result" => out.push(Update::Log(if string(v, "status") == "error" { LogKind::Warning } else { LogKind::Tool }, format!("Tool {} · {}: {}", string(v, "callId"), string(v, "status"), clip(string(v, "result"), 8192)))),
+            "status" => {
+                if string(v, "phase") == "turn_end" && string(v, "reason") != "completed" {
+                    out.push(Update::Error(format!("DeepSeek Harness turn ended: {}", string(v, "reason"))));
+                }
+                if let Some(usage) = v.get("usage") {
+                    self.harness_usage.input_tokens = self.harness_usage.input_tokens.saturating_add(usage["inputTokens"].as_u64().unwrap_or(0));
+                    self.harness_usage.output_tokens = self.harness_usage.output_tokens.saturating_add(usage["outputTokens"].as_u64().unwrap_or(0));
+                    out.push(Update::Usage(self.harness_usage.clone()));
+                }
+            }
+            "final" => {
+                self.terminal_seen = true;
+                self.final_response = Some(clip(string(v, "text"), MAX_OUTPUT_BYTES));
+                out.push(Update::Output(self.final_response.clone().unwrap_or_default()));
+            }
+            "error" => { self.terminal_seen = true; out.push(Update::Error(error_text(v))); }
+            _ => {}
+        }
     }
 
     fn reasoning(&mut self, out: &mut Vec<Update>) {
@@ -633,6 +669,38 @@ impl SseDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_deepseek_harness_projects_sessions_steps_reasoning_and_final_answers() {
+        let mut decoder = Decoder::new(Provider::DeepSeek);
+        let mut updates = vec![];
+        for event in [
+            serde_json::json!({"type":"session","sessionId":"session-exact-123"}),
+            serde_json::json!({"type":"thinking","text":"Inspect the files."}),
+            serde_json::json!({"type":"thinking","text":"Check the tests."}),
+            serde_json::json!({"type":"text","text":"Intermediate answer"}),
+            serde_json::json!({"type":"tool_call","tool":"read","callId":"call-1","input":{"path":"README.md"}}),
+            serde_json::json!({"type":"tool_result","callId":"call-1","status":"completed","result":"Readme content"}),
+            serde_json::json!({"type":"status","phase":"step_end","usage":{"inputTokens":10,"outputTokens":3}}),
+            serde_json::json!({"type":"status","phase":"step_end","usage":{"inputTokens":20,"outputTokens":4}}),
+            serde_json::json!({"type":"status","phase":"turn_end","reason":"completed"}),
+            serde_json::json!({"type":"final","text":"Complete answer"}),
+        ] { updates.extend(decoder.value(&event)); }
+        assert_eq!(decoder.session_id.as_deref(), Some("session-exact-123"));
+        assert!(decoder.terminal_seen && decoder.error.is_none());
+        assert_eq!(decoder.final_response.as_deref(), Some("Complete answer"));
+        assert!(updates.contains(&Update::Output("Complete answer".into())));
+        assert!(updates.contains(&Update::Reasoning("Inspect the files.\n\nCheck the tests.".into())));
+        assert!(updates.contains(&Update::Usage(Usage { input_tokens: 30, output_tokens: 7, cost_usd: None })));
+    }
+    #[test]
+    fn native_harness_failures_and_truncated_session_ids_are_not_successes() {
+        for event in [serde_json::json!({"type":"error","message":"Missing credential"}), serde_json::json!({"type":"status","phase":"turn_end","reason":"aborted"}), serde_json::json!({"type":"session","sessionId":"session-shortened","truncated":true})] {
+            let mut decoder = Decoder::new(Provider::DeepSeek);
+            decoder.value(&event); decoder.value(&serde_json::json!({"type":"final","text":""}));
+            assert!(decoder.error.is_some());
+            assert!(decoder.session_id.is_none());
+        }
+    }
     #[test]
     fn token_heartbeats_are_one_status_not_activity_spam() {
         let mut decoder = Decoder::new(Provider::Claude);

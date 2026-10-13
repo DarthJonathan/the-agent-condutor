@@ -1526,14 +1526,17 @@ private struct ConnectionCard: View {
                 if config.provider == .deepseek {
                     Picker("Interface", selection: $store.settings.deepseekMode) {
                         Text("Claude Code · agent").tag(DeepSeekMode.claudeCode)
+                        Text("DeepSeek Harness · agent").tag(DeepSeekMode.nativeHarness)
                         Text("Direct API · text").tag(DeepSeekMode.directApi)
-                    }.pickerStyle(.segmented).frame(maxWidth: 370)
+                    }.pickerStyle(.menu).frame(maxWidth: 420)
                     if store.settings.deepseekMode == .claudeCode {
                         Toggle("Use Claude Code’s existing DeepSeek configuration", isOn: $store.settings.deepseekUseCliConfig).font(.system(size: 12))
+                    } else if store.settings.deepseekMode == .nativeHarness {
+                        Text("Uses dsh headless with workspace tools and a separate saved session for every coworker. Keys are optional when dsh already has DeepSeek credentials. No Claude Code configuration is used.").font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                     } else {
                         Text("Direct API generates text and reasoning. It has no workspace file or shell tools.").font(.system(size: 11)).foregroundStyle(.secondary)
                     }
-                    if store.settings.deepseekMode == .directApi || !store.settings.deepseekUseCliConfig {
+                    if store.settings.deepseekMode != .claudeCode || !store.settings.deepseekUseCliConfig {
                         HStack(spacing: 18) {
                             field("API base URL", text: $store.settings.deepseekBaseUrl, placeholder: "https://api.deepseek.com")
                             VStack(alignment: .leading, spacing: 7) {
@@ -1552,11 +1555,14 @@ private struct ConnectionCard: View {
                     }
                 }
                 HStack(spacing: 18) {
+                    if config.provider == .deepseek && store.settings.deepseekMode == .nativeHarness {
+                        field("Harness executable", text: $store.settings.deepseekHarnessExecutable, placeholder: "Auto-detect dsh")
+                    }
                     if config.provider != .deepseek || store.settings.deepseekMode == .claudeCode {
                         field("Executable", text: $config.executable, placeholder: config.provider == .deepseek ? "Auto-detect claude" : config.provider == .kiro ? "Auto-detect kiro-cli" : "Auto-detect \(config.provider.name)")
                     }
                     if config.provider != .claude {
-                        field("Model", text: $config.model, placeholder: config.provider == .deepseek && !store.settings.deepseekUseCliConfig ? "deepseek-flash" : "CLI default")
+                        field("Model", text: $config.model, placeholder: config.provider == .deepseek && (store.settings.deepseekMode != .claudeCode || !store.settings.deepseekUseCliConfig) ? "deepseek-flash" : "CLI default")
                     }
                 }
                 VStack(alignment: .leading, spacing: 7) {
@@ -1574,6 +1580,9 @@ private struct ConnectionCard: View {
                 }
                 DisclosureGroup("Advanced", isExpanded: $advanced) {
                     VStack(alignment: .leading, spacing: 12) {
+                        if config.provider == .deepseek && store.settings.deepseekMode == .nativeHarness {
+                            Text("Conductor manages the native harness profile and session arguments. Additional arguments must be empty; clear any saved Claude Code arguments before using this interface.").font(.system(size: 11)).foregroundStyle(.secondary)
+                        }
                         field("Additional arguments · JSON array", text: $config.extraArgs, placeholder: "[]")
                         Toggle("Allow file edits", isOn: $config.allowEdits).font(.system(size: 12))
                         Text("Existing CLI permission rules still apply. Parallel agents share the selected workspace.").font(.system(size: 11)).foregroundStyle(.secondary)

@@ -53,7 +53,7 @@ enum Provider: String, Codable, CaseIterable, Identifiable {
         case .codex: path = "https://developers.openai.com/codex/noninteractive/"
         case .antigravity: path = "https://www.antigravity.google/docs/cli/headless/"
         case .qoder: path = "https://docs.qoder.com/cli/run-in-scripts"
-        case .deepseek: path = "https://api-docs.deepseek.com/quick_start/agent_integrations/claude_code/"
+        case .deepseek: path = "https://github.com/deepseek-ai/deepseek-harness"
         case .kiro: path = "https://kiro.dev/docs/cli/headless/"
         }
         return URL(string: path)!
@@ -71,7 +71,7 @@ enum Workflow: String, Codable, CaseIterable {
     }
 }
 
-enum DeepSeekMode: String, Codable { case claudeCode = "ClaudeCode", directApi = "DirectApi" }
+enum DeepSeekMode: String, Codable { case claudeCode = "ClaudeCode", nativeHarness = "NativeHarness", directApi = "DirectApi" }
 
 enum ClaudeBackend: String, Codable, CaseIterable {
     case inherit = "Inherit", anthropic = "Anthropic", deepseek = "DeepSeek", custom = "Custom"
@@ -154,6 +154,7 @@ struct Settings: Codable {
     var timeoutSeconds: UInt64 = 900
     var deepseekBaseUrl = "https://api.deepseek.com"
     var deepseekMode = DeepSeekMode.claudeCode
+    var deepseekHarnessExecutable = ""
     var deepseekUseCliConfig = false
     var claudeBackend = ClaudeBackend.inherit
     var claudeBaseUrl = ""
@@ -169,7 +170,7 @@ struct Settings: Codable {
     }
 
     enum CodingKeys: String, CodingKey {
-        case workspace, workspaceFolders, agents, workflow, timeoutSeconds, deepseekBaseUrl, deepseekMode, deepseekUseCliConfig
+        case workspace, workspaceFolders, agents, workflow, timeoutSeconds, deepseekBaseUrl, deepseekMode, deepseekUseCliConfig, deepseekHarnessExecutable
         case claudeBackend, claudeBaseUrl, claudeConfigDir
         case chatIntroduced
     }
@@ -191,6 +192,7 @@ extension Settings {
         timeoutSeconds = try values.decode(UInt64.self, forKey: .timeoutSeconds)
         deepseekBaseUrl = try values.decode(String.self, forKey: .deepseekBaseUrl)
         deepseekMode = try values.decode(DeepSeekMode.self, forKey: .deepseekMode)
+        deepseekHarnessExecutable = try values.decodeIfPresent(String.self, forKey: .deepseekHarnessExecutable) ?? ""
         deepseekUseCliConfig = try values.decode(Bool.self, forKey: .deepseekUseCliConfig)
         claudeBackend = try values.decodeIfPresent(ClaudeBackend.self, forKey: .claudeBackend) ?? .inherit
         claudeBaseUrl = try values.decodeIfPresent(String.self, forKey: .claudeBaseUrl) ?? ""

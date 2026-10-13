@@ -88,7 +88,7 @@ pub fn catalogs(settings: &Settings, snapshot: &Snapshot) -> Vec<ModelCatalog> {
                 Provider::Claude if claude_deepseek => vec![Effort::Low, Effort::High, Effort::Max],
                 Provider::DeepSeek => {
                     let mut levels = vec![Effort::Low, Effort::High, Effort::Max];
-                    if settings.deepseek_mode == DeepSeekMode::DirectApi { levels.insert(0, Effort::None); }
+                    if settings.deepseek_mode != DeepSeekMode::ClaudeCode { levels.insert(0, Effort::None); }
                     levels
                 }
                 Provider::Codex => vec![Effort::Low, Effort::Medium, Effort::High, Effort::Xhigh, Effort::Max],
@@ -103,6 +103,7 @@ pub fn catalogs(settings: &Settings, snapshot: &Snapshot) -> Vec<ModelCatalog> {
             let effort_note = match provider {
                 Provider::Claude if claude_deepseek => "DeepSeek supports Low, High, and Max through Claude Code.",
                 Provider::DeepSeek if settings.deepseek_mode == DeepSeekMode::DirectApi => "Off disables thinking; Low, High, and Max enable it.",
+                Provider::DeepSeek if settings.deepseek_mode == DeepSeekMode::NativeHarness => "Native DeepSeek Harness supports Off, Low, High, and Max through a per-run model overlay.",
                 Provider::DeepSeek => "DeepSeek supports Low, High, and Max through Claude Code.",
                 Provider::Codex => "Explicit models use their local Codex capability metadata. Default and custom models offer levels through Max; Codex checks model and account limits. Select a model to see its full range.",
                 Provider::Antigravity => "Antigravity headless supports Low, Medium, and High.",

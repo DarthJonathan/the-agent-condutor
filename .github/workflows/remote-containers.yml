@@ -7,6 +7,8 @@ on:
     paths:
       - 'backend/**'
       - 'frontend/**'
+      - 'scripts/signup-web-smoke.mjs'
+      - 'scripts/pwa-web-smoke.mjs'
       - 'deploy/**'
       - 'docker-compose.yml'
       - '.github/workflows/remote-containers.yml'
@@ -15,6 +17,8 @@ on:
     paths:
       - 'backend/**'
       - 'frontend/**'
+      - 'scripts/signup-web-smoke.mjs'
+      - 'scripts/pwa-web-smoke.mjs'
       - 'deploy/**'
       - 'docker-compose.yml'
       - '.github/workflows/remote-containers.yml'
@@ -83,6 +87,14 @@ jobs:
       - run: npm ci
       - run: npm test
       - run: npm run check
+      - run: npm run build
+      - name: Install isolated browser test runtime
+        run: npx playwright install --with-deps chromium
+      - name: Check signup and PWA offline behavior
+        working-directory: .
+        run: |
+          node scripts/signup-web-smoke.mjs
+          node scripts/pwa-web-smoke.mjs
       - name: Validate development and GHCR deployment configurations
         working-directory: .
         env:

@@ -26,10 +26,11 @@ enum WorkspaceSmoke {
         legacyJSON["agents"] = (legacyJSON["agents"] as! [[String: Any]]).filter { $0["provider"] as? String != "kiro" }.map { agent in
             var value = agent; value.removeValue(forKey: "effort"); return value
         }
-        for key in ["claude_backend", "claude_base_url", "claude_config_dir"] { legacyJSON.removeValue(forKey: key) }
+        for key in ["claude_backend", "claude_base_url", "claude_config_dir", "deepseek_harness_executable"] { legacyJSON.removeValue(forKey: key) }
         let restored = try decoder.decode(Settings.self, from: JSONSerialization.data(withJSONObject: legacyJSON))
         expect(restored.workspaceFolders == [first.path], "The old workspace must migrate without an extra current-directory entry")
         expect(restored.claudeBackend == .inherit && restored.claudeConfigDir.isEmpty, "Existing installations must keep their detected Claude configuration")
+        expect(restored.deepseekMode == .claudeCode && restored.deepseekHarnessExecutable.isEmpty, "Existing DeepSeek preferences must retain their Claude Code interface")
         expect(restored.agents.last?.provider == .kiro && restored.agents.last?.selected == false, "Existing preferences must gain an unselected Kiro connection")
         expect(restored.agents.allSatisfy { $0.effort == .default }, "Legacy connections must retain CLI effort defaults")
 
