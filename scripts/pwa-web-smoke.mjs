@@ -12,11 +12,12 @@ const localModules = path.resolve('frontend/node_modules');
 const modules = process.env.CONDUCTOR_PLAYWRIGHT_MODULES || (existsSync(path.join(localModules, 'playwright/package.json')) ? localModules : path.join(process.env.HOME, '.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules'));
 const { chromium } = createRequire(path.join(modules, 'playwright/package.json'))('playwright');
 const sessions = new Set(), streams = new Set();
-let account = 'one', expired = false, commands = 0, offlineBackend = false, workspaceReading = false;
-let heldCoworkerCommand, releaseCoworkerCommand;
+let account = 'one', expired = false, commands = 0, offlineBackend = false, workspaceReading = false, firstChatStatus = 'Completed';
+let heldCoworkerCommand, releaseCoworkerCommand, resolveCoworkerResponse;
+const coworkerResponse = new Promise(resolve => { resolveCoworkerResponse = resolve; });
 const user = () => ({ id: account, email: `${account}@example.test` });
 const run = id => ({ run_id: id, workspace_id: 'workspace', generation: 'generation', version: 1,
-  run: { title: `Fixture chat ${id}`, created_at: id, status: 'Completed', conversation: {
+  run: { title: `Fixture chat ${id}`, created_at: id, status: id === 'one' ? firstChatStatus : 'Completed', conversation: {
     coworkers: [{ id: 'maya', name: 'Maya', mention: 'maya', provider: 'codex', effort: 'default', can_read_workspace: workspaceReading }],
     messages: [{ id: `${id}-reply`, author_id: 'maya', kind: 'assistant', status: 'Completed', text: `# Saved reply ${id}\n\n| Agent | Status |\n| --- | --- |\n| Maya | Ready |` },
       { id: `${id}-question`, kind: 'assistant', question_request: { id: 'question', questions: [{ id: 'q', question: 'Which scope?', options: [{ id: 'a', label: 'Review it' }] }] },
@@ -55,7 +56,9 @@ const backend = http.createServer(async (request, response) => {
       heldCoworkerCommand = command;
       await new Promise(resolve => { releaseCoworkerCommand = resolve; });
     }
-    return reply({ id: 'command', status: 'queued' });
+    reply({ id: 'command', status: 'queued' });
+    if (command.kind === 'coworker') resolveCoworkerResponse();
+    return;
   }
   if (url.pathname === '/api/v1/devices/mac') return reply(snapshot(url.searchParams.get('run_id')));
   reply({ error: `Unexpected fixture route ${url.pathname}` }, 404);
@@ -135,8 +138,13 @@ try {
   for (const response of streams) response.write(`event: snapshot\ndata: ${JSON.stringify(snapshot('one'))}\n\n`);
   await page.waitForFunction(() => document.querySelector('[aria-label="Maya can read workspace"]')?.checked === true);
   releaseCoworkerCommand?.();
-  await new Promise(resolve => setTimeout(resolve, 25));
+  await coworkerResponse;
+  await page.getByText('Queued for your Mac.', { exact: true }).waitFor();
   assert.equal(await access.isChecked(), true, 'A delayed queue response must not overwrite the confirmed engine update');
+  // Cache a running conversation for the later offline Stop agents control check.
+  firstChatStatus = 'Running';
+  for (const response of streams) response.write(`event: snapshot\ndata: ${JSON.stringify(snapshot('one'))}\n\n`);
+  await page.getByRole('button', { name: 'Stop agents', exact: true }).waitFor();
   commands = 0;
   assert.equal(await history(page), null, 'Chat content must be opt-in');
   await page.getByLabel('Save chats offline', { exact: true }).check(); await saved(page);
