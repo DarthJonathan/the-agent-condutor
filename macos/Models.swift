@@ -320,7 +320,7 @@ struct TaskConversation: Decodable {
     let members: [Provider]
     let lead: Provider
     let messages: [ChatMessage]
-    let sessions: [AgentSession]
+    var sessions: [AgentSession]
     var names: [AgentIdentity]? = nil
     var models: [AgentModel]? = nil
     var efforts: [AgentEffort]? = nil
@@ -374,11 +374,15 @@ struct Coworker: Codable, Identifiable, Equatable {
     var role = CoworkerRole.general
     var model = ""
     var effort = Effort.default
+    var canReadWorkspace = true
+    var accessChangedAt: String? = nil
+    var blockedMessageIds: [String] = []
     var attention = "idle"
     var waitingFor: String? = nil
     var reviewId: String? = nil
     var identity: AgentIdentity { AgentIdentity(provider: provider, name: name, mention: mention, coworkerId: id) }
-    var command: [String: Any] { ["id": id, "provider": provider.rawValue, "name": name, "mention": mention, "role": role.rawValue, "model": model, "effort": effort.rawValue, "attention": attention, "waiting_for": waitingFor as Any? ?? NSNull()] }
+    var command: [String: Any] { ["id": id, "provider": provider.rawValue, "name": name, "mention": mention, "role": role.rawValue, "model": model, "effort": effort.rawValue, "can_read_workspace": canReadWorkspace, "attention": attention, "waiting_for": waitingFor as Any? ?? NSNull()] }
+    enum CodingKeys: String, CodingKey { case id, provider, name, mention, role, model, effort, canReadWorkspace, accessChangedAt, blockedMessageIds, attention, waitingFor, reviewId }
     func statusLabel(in coworkers: [Coworker]) -> String {
         switch attention {
         case "working": return "Working"
@@ -390,6 +394,21 @@ struct Coworker: Codable, Identifiable, Equatable {
         case "cancelled": return "Stopped"
         default: return "Available"
         }
+    }
+}
+
+extension Coworker {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id); provider = try c.decode(Provider.self, forKey: .provider)
+        name = try c.decode(String.self, forKey: .name); mention = try c.decode(String.self, forKey: .mention)
+        role = try c.decodeIfPresent(CoworkerRole.self, forKey: .role) ?? .general
+        model = try c.decodeIfPresent(String.self, forKey: .model) ?? ""; effort = try c.decodeIfPresent(Effort.self, forKey: .effort) ?? .default
+        canReadWorkspace = try c.decodeIfPresent(Bool.self, forKey: .canReadWorkspace) ?? true
+        accessChangedAt = try c.decodeIfPresent(String.self, forKey: .accessChangedAt)
+        blockedMessageIds = try c.decodeIfPresent([String].self, forKey: .blockedMessageIds) ?? []
+        attention = try c.decodeIfPresent(String.self, forKey: .attention) ?? "idle"
+        waitingFor = try c.decodeIfPresent(String.self, forKey: .waitingFor); reviewId = try c.decodeIfPresent(String.self, forKey: .reviewId)
     }
 }
 

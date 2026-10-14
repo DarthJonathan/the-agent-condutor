@@ -404,7 +404,7 @@ async fn publish(
                 snapshot.runs.clone(),
             )
         };
-        let connections:Vec<Value>=state["settings"]["agents"].as_array().into_iter().flatten().map(|agent|json!({"provider":agent["provider"],"model":agent["model"],"effort":agent["effort"],"available":state["agents"].as_array().is_some_and(|agents|agents.iter().any(|a|a["provider"]==agent["provider"]&&a["status"]=="ready"))})).collect();
+        let connections:Vec<Value>=state["settings"]["agents"].as_array().into_iter().flatten().map(|agent|json!({"provider":agent["provider"],"model":agent["model"],"effort":agent["effort"],"available":state["agents"].as_array().is_some_and(|agents|agents.iter().any(|a|a["provider"]==agent["provider"]&&a["status"]=="ready")),"snippets_only":state["protocol_version"]==2 && serde_json::from_value::<Provider>(agent["provider"].clone()).ok().zip(serde_json::from_value::<crate::model::DeepSeekMode>(state["settings"]["deepseek_mode"].clone()).ok()).is_some_and(|(provider,mode)|crate::runner::supports_snippets(provider,mode))})).collect();
         let advertisement = json!({"workspaces":config.workspaces.iter().map(|w|json!({"id":w.id,"label":w.label})).collect::<Vec<_>>(),"connections":connections});
         if advertisement != advertised || last.elapsed() > Duration::from_secs(15) {
             request(
@@ -596,6 +596,16 @@ fn translate(
     if !p.is_object() {
         bail!("Invalid payload")
     }
+    let snippets_supported = |provider: Provider| -> bool {
+        state["protocol_version"] == json!(2)
+            && serde_json::from_value::<crate::model::DeepSeekMode>(state["settings"]["deepseek_mode"].clone())
+                .ok()
+                .is_some_and(|mode| crate::runner::supports_snippets(provider, mode))
+    };
+    let require_snippets = |provider: Provider| -> Result<()> {
+        if snippets_supported(provider) { Ok(()) }
+        else { bail!("This engine does not support snippets-only access for {}. Update and restart the engine before disabling workspace reading.", provider.name()) }
+    };
     let get_id = |key: &str| -> Result<Uuid> {
         Ok(Uuid::parse_str(p[key].as_str().context("Missing ID")?)?)
     };
@@ -605,6 +615,7 @@ fn translate(
             bail!("Choose one to six coworkers")
         }
         let model = p["model"].as_str().unwrap_or("");
+        let access: HashMap<Provider, bool> = p.get("workspace_access").map(|v| serde_json::from_value(v.clone())).transpose()?.unwrap_or_default();
         let effort: Effort =
             serde_json::from_value(p.get("effort").cloned().unwrap_or(json!("default")))?;
         let mut workers = vec![];
@@ -618,6 +629,9 @@ fn translate(
             {
                 bail!("Connection unavailable")
             }
+            if access.get(&provider) == Some(&false) {
+                require_snippets(provider)?;
+            }
             let name = ["Maya", "Alex", "Ivy", "Noah", "Eva", "Kai"][i];
             workers.push(team::Coworker {
                 id: Uuid::new_v4(),
@@ -627,6 +641,9 @@ fn translate(
                 role: team::Role::General,
                 model: model.into(),
                 effort,
+                can_read_workspace: access.get(&provider).copied().unwrap_or(true),
+                access_changed_at: None,
+                blocked_message_ids: vec![],
                 attention: team::Attention::Idle,
                 waiting_for: None,
                 review_id: None,
@@ -715,9 +732,13 @@ fn translate(
                 .and_then(|ws| ws.iter().find(|w| w["id"] == json!(worker_id)))
                 .context("Unknown coworker")?;
             let mut worker: team::Coworker = serde_json::from_value(raw.clone())?;
-            worker.model = p["model"].as_str().context("Missing model")?.into();
-            worker.effort = serde_json::from_value(p["effort"].clone())?;
-            Ok(json!({"type":"update_coworker","run_id":id,"coworker":worker}))
+            if let Some(model) = p.get("model") { worker.model = model.as_str().context("Invalid model")?.into(); }
+            if let Some(effort) = p.get("effort") { worker.effort = serde_json::from_value(effort.clone())?; }
+            if let Some(read) = p.get("can_read_workspace") {
+                worker.can_read_workspace = read.as_bool().context("Invalid workspace access")?;
+                if !worker.can_read_workspace { require_snippets(worker.provider)?; }
+            }
+            Ok(json!({"type":"update_coworker","run_id":id,"coworker":worker,"change_access":p.get("can_read_workspace").is_some()}))
         }
         _ => bail!("Remote command is not permitted"),
     }

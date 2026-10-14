@@ -18,6 +18,9 @@ enum TeamStoreSmoke {
         store.settings.claudeBackend = .anthropic
         for index in store.settings.agents.indices { store.settings.agents[index].selected = [.claude, .codex].contains(store.settings.agents[index].provider) }
         store.loaded = true; store.connected = true
+        store.engineNeedsRestart = true
+        expect(store.engineNeedsRestart, "An incompatible engine must keep the upgrade guidance visible")
+        store.engineNeedsRestart = false
         store.agents = Provider.allCases.map { AgentInfo(provider: $0, status: "ready", label: "Fixture", detail: "Fixture") }
         expect(store.effortOptions(.codex).contains(.max), "Codex Default must offer Max before the catalogue loads")
         store.settings.deepseekMode = .nativeHarness
@@ -82,6 +85,17 @@ enum TeamStoreSmoke {
         var renamed = builder; renamed.name = "Atlas"; renamed.mention = "atlas"
         expect(store.updateCoworker(renamed) == nil && store.coworkers[1].id == builder.id && store.chatRun?.conversation?.sessions.count == 2, "Renaming must preserve identity and both native sessions")
         expect(store.chatRun?.summary.matchesSearch("Atlas") == true && store.chatRun?.summary.matchesSearch("Reviewer") == true, "History must search employee names and roles")
+        var restricted = store.coworkers[1]; restricted.canReadWorkspace = false
+        expect(store.updateCoworker(restricted, changeAccess: true) == nil && store.chatRun?.conversation?.sessions.count == 2 && store.coworkers[1].canReadWorkspace, "A rejected or racing access change must leave the persisted coworker and native sessions authoritative")
+        expect(store.coworkers[1].command["can_read_workspace"] as? Bool == true, "The UI must not show snippets-only access until the engine confirms it")
+        let workerEncoder = JSONEncoder(); workerEncoder.keyEncodingStrategy = .convertToSnakeCase
+        let workerDecoder = JSONDecoder(); workerDecoder.keyDecodingStrategy = .convertFromSnakeCase
+        let restoredWorker = try workerDecoder.decode(Coworker.self, from: workerEncoder.encode(store.coworkers[1]))
+        expect(restoredWorker.canReadWorkspace, "The rejected access change must not be persisted")
+        var legacyWorker = try JSONSerialization.jsonObject(with: workerEncoder.encode(store.coworkers[1])) as! [String: Any]
+        legacyWorker.removeValue(forKey: "can_read_workspace")
+        let migratedWorker = try workerDecoder.decode(Coworker.self, from: JSONSerialization.data(withJSONObject: legacyWorker))
+        expect(migratedWorker.canReadWorkspace, "Older coworkers must retain workspace access")
         store.reuse(store.chatRun!)
         expect(Set(store.coworkers.map(\.id)).isDisjoint(with: original.map(\.id)) && store.coworkers[1].model == "model-a" && store.coworkers[2].effort == .high, "Use Task Again must keep role/model/effort choices while creating independent coworkers")
         let question = AgentQuestionRequest(id: "question", questions: [AgentUserQuestion(id: "q", header: "Scope", question: "Which scope?", options: [], multiSelect: false)], answers: nil)

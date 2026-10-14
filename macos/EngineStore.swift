@@ -301,9 +301,10 @@ extension EngineStore {
         if !draftCoworkers.contains(where: { $0.id == coworkerLead }) { coworkerLead = draftCoworkers.first?.id ?? "" }
         coworkerDrafts[settings.workspace] = draftCoworkers
     }
-    func updateCoworker(_ proposed: Coworker) -> String? {
+    func updateCoworker(_ proposed: Coworker, changeAccess: Bool = false) -> String? {
         guard canChangeChatModels, coworkers.contains(where: { $0.id == proposed.id }) else { return "Wait for the current exchange before editing a coworker." }
         var worker = proposed
+        if !changeAccess, let current = coworkers.first(where: { $0.id == worker.id }) { worker.canReadWorkspace = current.canReadWorkspace }
         worker.name = worker.name.trimmingCharacters(in: .whitespacesAndNewlines)
         worker.mention = worker.mention.trimmingCharacters(in: .whitespacesAndNewlines).drop(while: { $0 == "@" }).lowercased()
         let others = coworkers.filter { $0.id != worker.id }
@@ -319,8 +320,14 @@ extension EngineStore {
         if worker.effort != .default && !effortOptions(worker.provider, model: worker.model.isEmpty ? defaultModel(worker.provider) : worker.model).contains(worker.effort) { return "Choose an effort supported by this coworker's model." }
         if var run = chatRun, let index = run.conversation?.coworkers?.firstIndex(where: { $0.id == worker.id }) {
             guard worker.provider == run.conversation?.coworkers?[index].provider else { return "Create a new coworker in a new chat to change its connection." }
+            if changeAccess && worker.canReadWorkspace != run.conversation?.coworkers?[index].canReadWorkspace {
+                // The engine owns the policy boundary and session reset. Keep the
+                // persisted chat authoritative until its RunUpdated confirmation.
+                send(["type": "update_coworker", "run_id": run.id, "coworker": worker.command, "change_access": true])
+                return nil
+            }
             run.conversation?.coworkers?[index] = worker; selectedRun = run
-            send(["type": "update_coworker", "run_id": run.id, "coworker": worker.command])
+            send(["type": "update_coworker", "run_id": run.id, "coworker": worker.command, "change_access": changeAccess])
         } else if let index = draftCoworkers.firstIndex(where: { $0.id == worker.id }) { draftCoworkers[index] = worker; coworkerDrafts[settings.workspace] = draftCoworkers }
         return nil
     }
@@ -407,6 +414,7 @@ final class EngineStore: ObservableObject {
     @Published var screen = "workspace"
     @Published var loaded = false
     @Published var connected = false
+    @Published var engineNeedsRestart = false
     @Published var demo = false
     @Published var persistenceBlocked = false
     @Published var notice: String?
@@ -689,10 +697,14 @@ final class EngineStore: ObservableObject {
         switch event.type {
         case "remote_state": remote.receive(event.remote)
         case "state":
-            guard event.protocolVersion == 1, let settings = event.settings else {
-                showNotice("This interface and engine use incompatible versions.", error: true)
+            guard event.protocolVersion == 2, let settings = event.settings else {
+                loaded = false
+                engineNeedsRestart = true
+                runs = event.runs ?? []
+                showNotice("This background engine is too old for code-access controls. Quit the older background process after agents are idle, then reopen this app.", error: true)
                 return
             }
+            engineNeedsRestart = false
             applying = true
             self.settings = settings
             applying = false
@@ -981,6 +993,7 @@ final class EngineStore: ObservableObject {
             } else { send(["type": "chat", "run_id": chatRun?.id as Any? ?? NSNull(), "prompt": prompt, "lead": effectiveLead.rawValue, "settings": encodedSettings(), "names": chatIdentities.map(\.command), "models": chatModels.map(\.command), "efforts": chatEfforts.map(\.command), "team_discussion": teamDiscussion]) }
         } else { send(["type": "start", "prompt": prompt, "settings": encodedSettings()]) }
     }
+
     func canAnswerQuestion(runID: String, message: ChatMessage) -> Bool {
         loaded && connected && !demo && !busy && !pendingChat && pendingQuestionReplies.isEmpty
         && selectedRun?.id == runID && message.questionRequest?.answers == nil && message.questionRequest != nil

@@ -156,6 +156,10 @@ pub struct Plan {
     pub deepseek_override: Option<Override>,
     pub claude_config_dir: String,
     pub session_scope: String,
+    pub can_read_workspace: bool,
+    pub protected_projects: Vec<PathBuf>,
+    pub codex_snippet_overrides: Vec<String>,
+    pub codex_api_key_available: bool,
 }
 
 pub fn prepare(
@@ -420,8 +424,42 @@ pub fn prepare_with_keys(
         deepseek_override,
         claude_config_dir: settings.claude_config_dir.clone(),
         session_scope,
+        can_read_workspace: true,
+        protected_projects: vec![],
+        codex_snippet_overrides: vec![],
+        codex_api_key_available: std::env::var_os("CODEX_API_KEY").is_some_and(|key| !key.is_empty()),
     };
     Ok((run, plan))
+}
+
+pub fn supports_snippets(provider: Provider, mode: DeepSeekMode) -> bool {
+    provider == Provider::DeepSeek && mode == DeepSeekMode::DirectApi || cfg!(target_os = "macos") &&
+        (provider == Provider::Codex || provider == Provider::Claude || provider == Provider::DeepSeek && mode == DeepSeekMode::ClaudeCode)
+}
+
+pub fn restrict_workspace(plan: &mut Plan) -> Result<()> {
+    let task = &mut plan.tasks[0];
+    if !task.extra_args.is_empty() {
+        bail!("Snippets-only access requires empty Additional arguments in Connections.");
+    }
+    if !supports_snippets(task.config.provider, plan.deepseek_mode) {
+        bail!("Snippets-only CLI access currently supports Codex and Claude Code on macOS, or DeepSeek Direct API. This connection cannot run with workspace reading disabled.");
+    }
+    if task.config.provider == Provider::Codex && !plan.codex_api_key_available {
+        bail!("Snippets-only Codex access requires CODEX_API_KEY. ChatGPT-managed Codex credentials cannot safely run from disposable state.");
+    }
+    plan.can_read_workspace = false;
+    task.config.allow_edits = false;
+    task.resume_session = None;
+    if task.config.provider == Provider::Claude && plan.claude_override.is_none() {
+        plan.claude_override = Some(claude_config::inspect(&plan.workspace.to_string_lossy(), &plan.claude_config_dir).snippets_override(&task.config.model)?);
+    }
+    #[cfg(target_os = "macos")]
+    if task.config.provider == Provider::Codex {
+        plan.codex_snippet_overrides = crate::code_access::codex_snippet_overrides()?;
+    }
+    plan.session_scope.push_str("-snippets-v1");
+    Ok(())
 }
 
 fn has_model_override(provider: Provider, args: &[String]) -> bool {
@@ -1101,6 +1139,9 @@ async fn run_cli_result(
     prompt: &str,
     emitter: &Emitter,
 ) -> Result<(String, Option<String>)> {
+    if !plan.can_read_workspace && !cfg!(target_os = "macos") {
+        bail!("Snippets-only CLI access requires the macOS process sandbox.");
+    }
     let executable = task
         .executable
         .as_ref()
@@ -1139,9 +1180,40 @@ async fn run_cli_result(
     let _private_settings = routing
         .map(|routing| routing.apply(&mut command))
         .transpose()?;
+    #[cfg(target_os = "macos")]
+    let _snippet_process = if !plan.can_read_workspace {
+        let mut protected = plan.protected_projects.clone(); protected.push(plan.workspace.clone());
+        Some(crate::code_access::SnippetProcess::new(executable, task.config.provider, &protected,
+            &claude_config::config_directory(&plan.claude_config_dir), _private_settings.as_ref().map(|f| f.path()), plan.codex_api_key_available)?)
+    } else { None };
+    #[cfg(target_os = "macos")]
+    if let Some(isolated) = &_snippet_process {
+        let env = command.as_std().get_envs().map(|(k,v)| (k.to_os_string(), v.map(|v| v.to_os_string()))).collect::<Vec<_>>();
+        let route_args = command.as_std().get_args().map(|a| a.to_os_string()).collect::<Vec<_>>();
+        command = isolated.command(executable);
+        for (k,v) in env { if k != "CLAUDE_CONFIG_DIR" { if let Some(v) = v { command.env(k,v); } else { command.env_remove(k); } } }
+        command.args(route_args);
+    }
+    let (mut args, input) = (args, input);
+    if !plan.can_read_workspace {
+        let mut restricted = Vec::new();
+        // Insert controls before the prompt separator, after the exec subcommand.
+        if task.config.provider == Provider::Codex {
+            restricted.extend(["--ignore-user-config", "--ignore-rules", "--skip-git-repo-check", "--ephemeral"].map(str::to_owned));
+            for config in &plan.codex_snippet_overrides {
+                restricted.extend(["-c".into(), config.clone()]);
+            }
+            for config in ["features.shell_tool=false", "features.unified_exec=false", "features.multi_agent=false", "features.shell_snapshot=false", "tools.view_image=false", "apps._default.enabled=false", "mcp_servers={}", "web_search=\"disabled\"", "project_doc_max_bytes=0", "cli_auth_credentials_store=\"file\""] {
+                restricted.extend(["-c".into(), config.into()]);
+            }
+            args.splice(1..1, restricted);
+        } else {
+            restricted.extend(["--safe-mode", "--tools", "", "--strict-mcp-config", "--mcp-config", "{\"mcpServers\":{}}", "--disable-slash-commands", "--no-chrome", "--no-session-persistence", "--setting-sources", ""].map(str::to_owned));
+            args.splice(0..0, restricted);
+        }
+    }
     command
         .args(args)
-        .current_dir(&plan.workspace)
         .env("PATH", executable_search_path())
         .env("NO_COLOR", "1")
         .stdin(if input.is_some() {
@@ -1152,6 +1224,7 @@ async fn run_cli_result(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    if plan.can_read_workspace { command.current_dir(&plan.workspace); }
     #[cfg(unix)]
     {
         command.process_group(0);
@@ -1641,6 +1714,10 @@ printf '%s\n' '{"type":"session","sessionId":"session-native-fixture"}' '{"type"
             deepseek_override: None,
             claude_config_dir: String::new(),
             session_scope: String::new(),
+            can_read_workspace: true,
+            protected_projects: vec![],
+            codex_snippet_overrides: vec![],
+            codex_api_key_available: true,
         };
         (dir, plan)
     }
@@ -1953,7 +2030,50 @@ printf '%s\n' '{"type":"session","sessionId":"session-native-fixture"}' '{"type"
             deepseek_override: None,
             claude_config_dir: String::new(),
             session_scope: String::new(),
+            can_read_workspace: true,
+            protected_projects: vec![],
+            codex_snippet_overrides: vec![],
+            codex_api_key_available: false,
         }
+    }
+
+    #[test]
+    fn snippets_access_is_explicit_and_rejects_cli_override_routes() {
+        let mut plan = api_plan("https://api.deepseek.com".into());
+        plan.tasks[0].resume_session = Some("old-workspace-session".into());
+        plan.tasks[0].config.allow_edits = true;
+        restrict_workspace(&mut plan).unwrap();
+        assert!(!plan.can_read_workspace && !plan.tasks[0].config.allow_edits);
+        assert!(plan.tasks[0].resume_session.is_none());
+        assert!(plan.session_scope.ends_with("-snippets-v1"));
+        let mut plan = api_plan("https://api.deepseek.com".into());
+        plan.tasks[0].extra_args = vec!["--dangerously-bypass-approvals-and-sandbox".into()];
+        assert!(restrict_workspace(&mut plan).is_err());
+        for provider in [Provider::Qoder, Provider::Kiro, Provider::Antigravity] { assert!(!supports_snippets(provider, DeepSeekMode::ClaudeCode)); }
+        assert!(!supports_snippets(Provider::DeepSeek, DeepSeekMode::NativeHarness));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn snippets_headless_cli_gets_stdin_but_cannot_read_its_path() {
+        let script = r#"read -r code_path
+for arg do
+    if [ "$arg" = 'features.shell_tool=false' ]; then shell_disabled=yes; fi
+    if [ "$arg" = '--ephemeral' ]; then ephemeral=yes; fi
+    if [ "$arg" = 'resume' ]; then exit 20; fi
+done
+[ "$shell_disabled" = yes ] && [ "$ephemeral" = yes ] || exit 21
+if /bin/cat "$code_path"; then exit 22; fi
+printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"Reasoned from supplied snippets"}}' '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}'
+"#;
+        let (_runtime, mut plan) = fixture(script, Provider::Codex);
+        let workspace = tempfile::tempdir().unwrap();
+        let code = workspace.path().join("source.rs"); std::fs::write(&code, "PRIVATE_CODE").unwrap();
+        plan.workspace = workspace.path().into(); plan.tasks[0].resume_session = Some("old-repo-session".into());
+        restrict_workspace(&mut plan).unwrap();
+        let (emitter, _receiver) = emitter();
+        let answer = run_cli(&plan, &plan.tasks[0], &format!("{}\n", code.display()), &emitter).await.unwrap();
+        assert_eq!(answer, "Reasoned from supplied snippets");
     }
 
     #[tokio::test]

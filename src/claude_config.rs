@@ -399,6 +399,15 @@ fn inspect_sources(
 }
 
 impl Inspection {
+    pub fn snippets_override(&self, model: &str) -> Result<Override> {
+        if self.snapshot.sources.iter().any(|s| s.error.is_some()) {
+            bail!("Fix unreadable Claude settings in Connections before using snippets-only access.");
+        }
+        if self.helper && !AUTH.iter().any(|key| nonempty(&self.env, key)) {
+            bail!("Snippets-only access cannot execute apiKeyHelper. Supply a session API key or OAuth token in Connections.");
+        }
+        Ok(Override { env: self.env.clone(), model: if model.is_empty() { self.snapshot.conductor_model.clone() } else { model.into() }, clear_helper: true })
+    }
     pub fn is_deepseek(&self) -> bool {
         self.snapshot.backend == "DeepSeek"
     }

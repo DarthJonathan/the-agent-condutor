@@ -77,6 +77,8 @@ enum Command {
     UpdateCoworker {
         run_id: Uuid,
         coworker: team::Coworker,
+        #[serde(default)]
+        change_access: bool,
     },
     CancelMail {
         run_id: Uuid,
@@ -425,7 +427,7 @@ async fn serve(data_dir: Option<PathBuf>, demo: bool) -> Result<()> {
     emit(
         &mut output,
         Event::State {
-            protocol_version: 1,
+            protocol_version: 2,
             settings: &settings,
             runs: runs.iter().map(RunSummary::from).collect(),
             agents: agent_info(&agents),
@@ -486,6 +488,7 @@ async fn serve(data_dir: Option<PathBuf>, demo: bool) -> Result<()> {
                         match team::prepare(team::Input { existing, settings: &proposed, availability: &agents, coworkers, lead: lead_id, prompt: &prompt, discussion, target: target_id, resume_queue: false, new_run_id: Some(new_id), deepseek_key: &key, claude_key: &claude_key, kiro_key: &kiro_key }) {
                             Ok((mut run, mut plan)) => {
                                 if info.isolated { let changes = run.changes.get_or_insert_with(Default::default); if changes.base_commit.is_empty() { changes.base_commit = info.base_commit.clone(); } }
+                                plan.protect_project(info.project.clone().into());
                                 run.workspace_info = Some(info); let changes = workspace::capture(&run.workspace, run.changes.as_ref(), None); plan.set_changes(changes.clone()); run.changes = Some(changes);
                                 settings = next; settings.repair(); dirty = true;
                                 let id = run.id; let token = CancellationToken::new(); team_controls.insert(id, plan.control.clone());
@@ -527,7 +530,7 @@ async fn serve(data_dir: Option<PathBuf>, demo: bool) -> Result<()> {
                             Err(error) => emit(&mut output, Event::Notice { message: error.to_string(), error: true }).await?,
                         }
                     }
-                    Command::UpdateCoworker { run_id, coworker } => {
+                    Command::UpdateCoworker { run_id, coworker, change_access } => {
                         if demo || active.contains_key(&run_id) { emit(&mut output, Event::Notice { message: "Wait for this chat's current exchange before editing a coworker.".into(), error: true }).await?; continue; }
                         if let Some(run) = runs.iter_mut().find(|r| r.id == run_id) && let Some(chat) = &mut run.conversation {
                             let mut proposed = chat.coworkers.clone();
@@ -542,7 +545,10 @@ async fn serve(data_dir: Option<PathBuf>, demo: bool) -> Result<()> {
                                 }
                                 Ok(())
                             })();
-                            match validation { Ok(()) => { chat.coworkers = proposed; dirty = true; emit(&mut output, Event::RunUpdated { run }).await?; }, Err(error) => emit(&mut output, Event::Notice { message: error.to_string(), error: true }).await? }
+                            match validation { Ok(()) => {
+                                for worker in &mut proposed { team::change_access(chat, worker, change_access); }
+                                chat.coworkers = proposed; dirty = true; emit(&mut output, Event::RunUpdated { run }).await?;
+                            }, Err(error) => emit(&mut output, Event::Notice { message: error.to_string(), error: true }).await? }
                         }
                     }
                     Command::CancelMail { run_id, mail_id } => {
@@ -573,6 +579,11 @@ async fn serve(data_dir: Option<PathBuf>, demo: bool) -> Result<()> {
                     }
                     Command::TeamApproval { run_id, message_id, request_id, approved, settings: next } => {
                         if demo || !active.is_empty() { emit(&mut output, Event::Notice { message: "Wait for the current exchange before deciding this approval.".into(), error: true }).await?; continue; }
+                        let restricted = runs.iter().find(|r| r.id == run_id).and_then(|r| r.conversation.as_ref()).is_some_and(|c| {
+                            c.messages.iter().find(|m| m.id == message_id).and_then(|m| m.author_id)
+                                .is_some_and(|id| c.coworkers.iter().any(|w| w.id == id && !w.can_read_workspace))
+                        });
+                        if approved && restricted { emit(&mut output, Event::Notice { message: "This coworker has snippets-only access. A teammate with workspace access must run commands.".into(), error: true }).await?; continue; }
                         if let Some(run) = runs.iter_mut().find(|r| r.id == run_id) && let Some(message) = run.conversation.as_mut().and_then(|c| c.messages.iter_mut().find(|m| m.id == message_id))
                             && let Some(approval) = message.approval_request.as_mut().filter(|a| a.id == request_id && a.decision.is_none()) {
                             approval.decision = Some(approved); let argv = approval.argv.clone(); let owner = message.author_id; let path = run.workspace.clone(); settings = next; settings.repair(); run.status = Status::Running;

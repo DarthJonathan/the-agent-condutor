@@ -12,11 +12,12 @@ const localModules = path.resolve('frontend/node_modules');
 const modules = process.env.CONDUCTOR_PLAYWRIGHT_MODULES || (existsSync(path.join(localModules, 'playwright/package.json')) ? localModules : path.join(process.env.HOME, '.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules'));
 const { chromium } = createRequire(path.join(modules, 'playwright/package.json'))('playwright');
 const sessions = new Set(), streams = new Set();
-let account = 'one', expired = false, commands = 0, offlineBackend = false;
+let account = 'one', expired = false, commands = 0, offlineBackend = false, workspaceReading = false;
+let heldCoworkerCommand, releaseCoworkerCommand;
 const user = () => ({ id: account, email: `${account}@example.test` });
 const run = id => ({ run_id: id, workspace_id: 'workspace', generation: 'generation', version: 1,
-  run: { title: `Fixture chat ${id}`, created_at: id, status: 'Running', conversation: {
-    coworkers: [{ id: 'maya', name: 'Maya', mention: 'maya', provider: 'codex', effort: 'default' }],
+  run: { title: `Fixture chat ${id}`, created_at: id, status: 'Completed', conversation: {
+    coworkers: [{ id: 'maya', name: 'Maya', mention: 'maya', provider: 'codex', effort: 'default', can_read_workspace: workspaceReading }],
     messages: [{ id: `${id}-reply`, author_id: 'maya', kind: 'assistant', status: 'Completed', text: `# Saved reply ${id}\n\n| Agent | Status |\n| --- | --- |\n| Maya | Ready |` },
       { id: `${id}-question`, kind: 'assistant', question_request: { id: 'question', questions: [{ id: 'q', question: 'Which scope?', options: [{ id: 'a', label: 'Review it' }] }] },
         approval_request: { id: 'approval', summary: 'Fixture operation', argv: ['fixture'] } }]
@@ -24,7 +25,7 @@ const run = id => ({ run_id: id, workspace_id: 'workspace', generation: 'generat
 });
 function snapshot(selected) {
   return { device: { id: 'mac', name: 'Fixture Mac', last_seen: new Date().toISOString() }, workspaces: [{ id: 'workspace', label: 'Fixture project' }],
-    connections: [{ provider: 'codex', available: true }], commands: [],
+    connections: [{ provider: 'codex', available: true, snippets_only: true }], commands: [],
     runs: ['one', 'two'].map(id => id === selected ? run(id) : { ...run(id), summary: true, run: { title: `Fixture chat ${id}`, created_at: id } }) };
 }
 const backend = http.createServer(async (request, response) => {
@@ -47,7 +48,15 @@ const backend = http.createServer(async (request, response) => {
     response.write(`event: snapshot\ndata: ${JSON.stringify(snapshot(url.searchParams.get('run_id')))}\n\n`);
     streams.add(response); request.on('close', () => streams.delete(response)); return;
   }
-  if (url.pathname.includes('/commands')) { commands++; return reply({ id: 'command', status: 'queued' }); }
+  if (url.pathname.includes('/commands')) {
+    let body = ''; for await (const chunk of request) body += chunk;
+    const command = JSON.parse(body); commands++;
+    if (command.kind === 'coworker') {
+      heldCoworkerCommand = command;
+      await new Promise(resolve => { releaseCoworkerCommand = resolve; });
+    }
+    return reply({ id: 'command', status: 'queued' });
+  }
   if (url.pathname === '/api/v1/devices/mac') return reply(snapshot(url.searchParams.get('run_id')));
   reply({ error: `Unexpected fixture route ${url.pathname}` }, 404);
 });
@@ -114,6 +123,21 @@ try {
   }
   await login(); await page.getByRole('button', { name: 'Fixture chat one', exact: true }).click();
   await page.getByRole('heading', { name: 'Saved reply one', exact: true }).waitFor();
+  // A queued grant must never leave an old access value in the control when an
+  // earlier engine snapshot confirms the change before the queue response.
+  const access = page.getByLabel('Maya can read workspace', { exact: true });
+  assert.equal(await access.isChecked(), false);
+  await access.click();
+  for (let i = 0; i < 100 && !heldCoworkerCommand; i++) await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal(heldCoworkerCommand?.payload?.can_read_workspace, true);
+  assert.equal(await access.isChecked(), false, 'Pending access commands must keep the engine snapshot value');
+  workspaceReading = true;
+  for (const response of streams) response.write(`event: snapshot\ndata: ${JSON.stringify(snapshot('one'))}\n\n`);
+  await page.waitForFunction(() => document.querySelector('[aria-label="Maya can read workspace"]')?.checked === true);
+  releaseCoworkerCommand?.();
+  await new Promise(resolve => setTimeout(resolve, 25));
+  assert.equal(await access.isChecked(), true, 'A delayed queue response must not overwrite the confirmed engine update');
+  commands = 0;
   assert.equal(await history(page), null, 'Chat content must be opt-in');
   await page.getByLabel('Save chats offline', { exact: true }).check(); await saved(page);
   await page.getByRole('button', { name: 'Fixture chat two', exact: true }).click();
@@ -161,6 +185,7 @@ try {
   console.log('PASS: install metadata/icons, real service worker, offline reload, opt-in bounded history, read-only controls, reconnect, account change, session expiry, sign-out and clearing');
   console.log('Preview: target/remote-web/pwa-offline.png');
 } finally {
+  releaseCoworkerCommand?.();
   await browser?.close(); server.kill('SIGTERM');
   for (const response of streams) response.destroy();
   backend.closeAllConnections(); await new Promise(resolve => backend.close(resolve));

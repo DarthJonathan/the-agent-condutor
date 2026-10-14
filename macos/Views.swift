@@ -27,6 +27,12 @@ struct RootView: View {
             }
             .background(Theme.background)
             .safeAreaInset(edge: .bottom, spacing: 0) {
+                VStack(spacing: 0) {
+                if store.engineNeedsRestart {
+                    HStack(spacing: 12) {
+                        Text("This background engine is too old for code-access controls. After agents are idle, quit the older Agent Conductor background process and reopen this app. If Remote is enabled, use Activity Monitor to quit the older process.").font(.system(size: 12)).fixedSize(horizontal: false, vertical: true)
+                    }.padding(14).background(Theme.panel)
+                }
                 if let notice = store.notice {
                     HStack(alignment: .top, spacing: 10) {
                         Image(systemName: store.noticeIsError ? "exclamationmark.circle" : "checkmark.circle")
@@ -35,6 +41,7 @@ struct RootView: View {
                         Spacer(minLength: 12)
                         if !store.persistenceBlocked { Button { store.notice = nil } label: { Image(systemName: "xmark") }.buttonStyle(.plain) }
                     }.padding(14).background(Theme.panel).overlay(alignment: .top) { Rectangle().fill(Theme.border).frame(height: 1) }
+                }
                 }
             }
         }
@@ -1629,6 +1636,11 @@ private struct CoworkerTeamPanel: View {
                         }
                         CoworkerModelMenu(worker: worker)
                         CoworkerEffortMenu(worker: worker)
+                        Toggle("Can read workspace", isOn: Binding(get: { worker.canReadWorkspace }, set: { read in
+                            var edited = worker; edited.canReadWorkspace = read
+                            if let error = store.updateCoworker(edited, changeAccess: true) { store.notice = error; store.noticeIsError = true }
+                        })).font(.system(size: 11)).disabled(!store.canChangeChatModels)
+                        if !worker.canReadWorkspace { Text("Snippets only · addressed messages, no workspace or shell access").font(.system(size: 10)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true) }
                     }.padding(11).background(Color.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 8))
                 }
                 if store.chatRun == nil {
@@ -1695,6 +1707,7 @@ private struct CoworkerEditSheet: View {
     @Environment(\.dismiss) private var dismiss
     @State var worker: Coworker
     @State private var error: String?
+    @State private var accessEdited = false
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             Text("Edit coworker").font(.system(size: 22, weight: .semibold))
@@ -1702,6 +1715,8 @@ private struct CoworkerEditSheet: View {
                 TextField("Name", text: $worker.name).onChange(of: worker.name) { old, name in if worker.mention == AgentIdentity.suggestedHandle(for: old, provider: worker.provider) { worker.mention = AgentIdentity.suggestedHandle(for: name, provider: worker.provider) } }
                 TextField("@handle", text: $worker.mention)
                 Picker("Role", selection: $worker.role) { ForEach(CoworkerRole.allCases) { role in Text(role.label).tag(role) } }
+                Toggle("Can read workspace", isOn: Binding(get: { worker.canReadWorkspace }, set: { worker.canReadWorkspace = $0; accessEdited = true }))
+                Text(worker.canReadWorkspace ? "Uses this chat's workspace and the connection's edit permissions." : "Receives addressed messages and supplied snippets. Changing access starts a fresh native session. Codex and Claude Code on macOS, or DeepSeek Direct API, support this mode; other connections are blocked.").font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 Text(worker.role.description).font(.system(size: 11)).foregroundStyle(.secondary)
                 Picker("Connection", selection: $worker.provider) { ForEach(Provider.allCases) { provider in Text(provider.name).tag(provider) } }.disabled(store.chatRun != nil)
                 Picker("Model", selection: $worker.model) {
@@ -1717,7 +1732,7 @@ private struct CoworkerEditSheet: View {
                 }
             }.formStyle(.grouped)
             if let error { Text(error).font(.system(size: 12)).foregroundStyle(.orange) }
-            HStack { Spacer(); Button("Cancel") { dismiss() }; Button("Save") { if let issue = store.updateCoworker(worker) { error = issue } else { dismiss() } }.buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction) }
+            HStack { Spacer(); Button("Cancel") { dismiss() }; Button("Save") { if let issue = store.updateCoworker(worker, changeAccess: accessEdited) { error = issue } else { dismiss() } }.buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction) }
         }.padding(24).frame(width: 470)
     }
 }

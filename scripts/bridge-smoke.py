@@ -98,7 +98,7 @@ def until(predicate):
         if predicate(event): return event
 try:
     initial = until(lambda e: e["type"] == "state")
-    assert initial["protocol_version"] == 1 and initial["runs"] == []
+    assert initial["protocol_version"] == 2 and initial["runs"] == []
     assert initial["settings"]["workspace_folders"] == [str(AREA)], "Legacy workspace was not migrated"
     assert initial["claude_config"]["backend"] == "DeepSeek"
     assert initial["claude_config"]["config_dir"] == str(CONFIG)

@@ -3,7 +3,7 @@ import type { RunEnvelope } from './protocol';
 export type SavedDevice = {
   device: { id: string; name: string; last_seen: string };
   workspaces: { id: string; label: string }[];
-  connections: { provider: string; available: boolean; model: string; effort: string }[];
+  connections: { provider: string; available: boolean; model: string; effort: string; snippets_only?: boolean }[];
   runs: RunEnvelope[];
 };
 export type OfflineHistory = {

@@ -21,10 +21,11 @@ type WorkspaceInput struct {
 	Label string `json:"label"`
 }
 type Connection struct {
-	Provider  string `json:"provider"`
-	Model     string `json:"model"`
-	Effort    string `json:"effort"`
-	Available bool   `json:"available"`
+	Provider     string `json:"provider"`
+	Model        string `json:"model"`
+	Effort       string `json:"effort"`
+	Available    bool   `json:"available"`
+	SnippetsOnly bool   `json:"snippets_only"`
 }
 type Upload struct {
 	Kind        string          `json:"kind"`
@@ -41,6 +42,67 @@ type Patch struct {
 	Op    string   `json:"op"`
 	Path  []string `json:"path"`
 	Value any      `json:"value,omitempty"`
+}
+
+// snippetsAccessAllowed keeps an older engine from silently accepting a request
+// that asked it to stop reading the workspace.  Granting reading back remains
+// available during an upgrade because it removes, rather than creates, access
+// restrictions.
+func snippetsAccessAllowed(connections []byte, kind string, payload json.RawMessage) error {
+	if kind != "chat" && kind != "coworker" {
+		return nil
+	}
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &body); err != nil {
+		return errors.New("invalid command payload")
+	}
+	needed := map[string]bool{}
+	if raw, ok := body["workspace_access"]; ok {
+		var access map[string]bool
+		if err := json.Unmarshal(raw, &access); err != nil {
+			return errors.New("invalid workspace access")
+		}
+		for provider, read := range access {
+			if !read {
+				needed[provider] = true
+			}
+		}
+	}
+	if raw, ok := body["can_read_workspace"]; ok {
+		var read bool
+		if err := json.Unmarshal(raw, &read); err != nil {
+			return errors.New("invalid workspace access")
+		}
+		if !read {
+			var provider string
+			if raw := body["provider"]; json.Unmarshal(raw, &provider) != nil || provider == "" {
+				return errors.New("snippets-only coworker changes require a provider")
+			}
+			needed[provider] = true
+		}
+	}
+	if len(needed) == 0 {
+		return nil
+	}
+	var advertised []Connection
+	if err := json.Unmarshal(connections, &advertised); err != nil {
+		return errors.New("device has invalid connection capabilities")
+	}
+	for provider := range needed {
+		if !containsSnippetConnection(advertised, provider) {
+			return errors.New("device connection does not support snippets-only access; update and restart its engine")
+		}
+	}
+	return nil
+}
+
+func containsSnippetConnection(connections []Connection, provider string) bool {
+	for _, connection := range connections {
+		if connection.Provider == provider && connection.SnippetsOnly {
+			return true
+		}
+	}
+	return false
 }
 
 func (s Relay) Device(ctx context.Context, token string) (*dao.Device, error) {
@@ -207,6 +269,9 @@ func (s Relay) Queue(ctx context.Context, user, device, workspace, id, kind stri
 		if time.Since(d.LastSeen) > 45*time.Second {
 			return ErrOffline
 		}
+		if err := snippetsAccessAllowed(d.Connections, kind, payload); err != nil {
+			return err
+		}
 		var w dao.Workspace
 		if err := tx.Where("id = ? AND device_id = ?", workspace, device).First(&w).Error; err != nil {
 			return err
@@ -241,8 +306,21 @@ func (s Relay) Claim(ctx context.Context, device string) ([]dao.Command, error) 
 		if err := pruneCommands(tx, device); err != nil {
 			return err
 		}
-		if err := tx.Where("device_id = ? AND expires_at > ? AND (status = 'queued' OR (status = 'leased' AND lease_until < ?))", device, now, now).Order("created_at,id").Limit(8).Find(&commands).Error; err != nil {
+		var candidates []dao.Command
+		if err := tx.Where("device_id = ? AND expires_at > ? AND (status = 'queued' OR (status = 'leased' AND lease_until < ?))", device, now, now).Order("created_at,id").Limit(64).Find(&candidates).Error; err != nil {
 			return err
+		}
+		for _, candidate := range candidates {
+			if err := snippetsAccessAllowed(d.Connections, candidate.Kind, candidate.Payload); err != nil {
+				if err := tx.Model(&candidate).Updates(map[string]any{"status": "failed", "result": "snippets-only access is no longer supported by this engine", "payload": []byte("{}")}).Error; err != nil {
+					return err
+				}
+				continue
+			}
+			commands = append(commands, candidate)
+			if len(commands) == 8 {
+				break
+			}
 		}
 		until := now.Add(30 * time.Second)
 		for i := range commands {

@@ -3,6 +3,7 @@
 mod app;
 mod bridge;
 mod claude_config;
+mod code_access;
 mod conversation;
 #[cfg(unix)]
 mod host;

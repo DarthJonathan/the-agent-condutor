@@ -77,12 +77,42 @@ pub struct Coworker {
     pub model: String,
     #[serde(default)]
     pub effort: Effort,
+    #[serde(default = "workspace_read_default")]
+    pub can_read_workspace: bool,
+    // Engine-owned boundary: old context cannot survive an access change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_changed_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocked_message_ids: Vec<Uuid>,
     #[serde(default)]
     pub attention: Attention,
     #[serde(default)]
     pub waiting_for: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_id: Option<Uuid>,
+}
+
+fn workspace_read_default() -> bool { true }
+
+pub fn change_access(chat: &mut Conversation, proposed: &mut Coworker, explicit: bool) {
+    let Some(previous) = chat.coworkers.iter().find(|w| w.id == proposed.id) else { return; };
+    proposed.access_changed_at = previous.access_changed_at;
+    proposed.blocked_message_ids = previous.blocked_message_ids.clone();
+    if !explicit { proposed.can_read_workspace = previous.can_read_workspace; }
+    if previous.can_read_workspace != proposed.can_read_workspace {
+        proposed.access_changed_at = Some(Utc::now());
+        proposed.blocked_message_ids = chat.messages.iter().map(|m| m.id).collect();
+        if matches!(proposed.attention, Attention::Queued | Attention::WaitingForCoworker) {
+            proposed.attention = Attention::Idle; proposed.waiting_for = None;
+        }
+        chat.sessions.retain(|s| s.coworker_id != Some(proposed.id));
+        // A paused request may contain repository output from the previous policy.
+        for mail in &mut chat.mailbox {
+            if mail.to == proposed.id && matches!(mail.state, MailState::Queued | MailState::Paused) {
+                mail.state = MailState::Cancelled;
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -204,6 +234,9 @@ pub fn migrate(chat: &mut Conversation, run_id: Uuid) {
                 .find(|e| e.provider == provider)
                 .map_or(Effort::Default, |e| e.effort),
             attention: Attention::Idle,
+            can_read_workspace: true,
+            access_changed_at: None,
+            blocked_message_ids: vec![],
             waiting_for: None,
             review_id: None,
         });
@@ -740,6 +773,14 @@ pub fn prepare(input: Input<'_>) -> Result<(Run, TeamPlan)> {
             Ok((_, mut agent)) => {
                 agent.kiro_key = input.kiro_key.into();
                 agent.run_id = run.id;
+                if !coworker.can_read_workspace {
+                    if let Err(error) = runner::restrict_workspace(&mut agent) {
+                        unavailable.insert(coworker.id, error.to_string());
+                        continue;
+                    }
+                    agent.protected_projects.extend(input.settings.workspace_folders.iter().map(std::path::PathBuf::from));
+                    if let Some(info) = &run.workspace_info { agent.protected_projects.push(info.project.clone().into()); }
+                }
                 let forbidden = [
                     "--resume",
                     "--resume-id",
@@ -862,6 +903,9 @@ pub fn cancel_saved(chat: &mut Conversation, id: Uuid) -> Result<()> {
 }
 
 impl TeamPlan {
+    pub fn protect_project(&mut self, path: std::path::PathBuf) {
+        for agent in self.agents.values_mut().filter(|a| !a.can_read_workspace) { agent.protected_projects.push(path.clone()); }
+    }
     pub fn set_changes(&mut self, changes: workspace::ChangeSet) {
         self.changes = Some(changes);
     }
@@ -1086,11 +1130,12 @@ fn context(plan: &TeamPlan, mail: &Mail) -> String {
         .iter()
         .map(|c| {
             format!(
-                "{} (@{}, {:?}, connection {})",
+                "{} (@{}, {:?}, connection {}, code access {})",
                 c.name,
                 c.mention,
                 c.role,
-                c.provider.name()
+                c.provider.name(),
+                if c.can_read_workspace { "workspace" } else { "snippets only" }
             )
         })
         .collect::<Vec<_>>()
@@ -1102,11 +1147,19 @@ fn context(plan: &TeamPlan, mail: &Mail) -> String {
         worker.provider.name(),
         roster,
         worker.role.instruction(),
-        clip(&plan.original, 8192)
+        if worker.can_read_workspace { clip(&plan.original, 8192) } else { String::from("Use only messages explicitly addressed to you below.") }
     );
+    if !worker.can_read_workspace {
+        text.push_str("\nCODE ACCESS: SNIPPETS ONLY. You have no workspace access or file/shell tools. Reason from explicitly supplied text; do not claim to inspect files or run commands. You may ask teammates for specific excerpts through the mailbox. Addressed teammate messages are explicit sharing, not permission to browse the repository. Do not request command approvals.\n");
+    }
     let mut recent = VecDeque::new();
     let mut bytes = 0;
+    let blocked: HashSet<_> = worker.blocked_message_ids.iter().copied().collect();
     for message in plan.chat.messages.iter().rev() {
+        if !worker.can_read_workspace && (blocked.contains(&message.id)
+            || !(message.author_id == Some(worker.id) || message.recipient_ids.contains(&worker.id))) {
+            continue;
+        }
         let excerpt = clip(&message.text, 4096);
         if bytes + excerpt.len() > 48 * 1024 {
             break;
@@ -1365,7 +1418,7 @@ pub async fn execute(mut plan: TeamPlan, emitter: Emitter, cancel: CancellationT
                 .iter()
                 .find(|s| s.coworker_id == Some(mail.to));
             agent.tasks[0].resume_session = previous
-                .filter(|s| s.scope == agent.session_scope)
+                .filter(|s| agent.can_read_workspace && s.scope == agent.session_scope)
                 .map(|s| s.session_id.clone());
             emitter
                 .send(Message::ChatAppend {
@@ -1398,6 +1451,9 @@ pub async fn execute(mut plan: TeamPlan, emitter: Emitter, cancel: CancellationT
         };
         let (raw, question) = questions::extract(&raw);
         let (mut raw, mut approval) = approval(&raw);
+        if !coworker(&plan.chat, mail.to).can_read_workspace && approval.take().is_some() {
+            raw.push_str("\nCommand request blocked: this coworker has snippets-only access. Ask a teammate with workspace access to perform the check.");
+        }
         if question.is_some() && approval.is_some() {
             approval = None;
             raw.push_str("\nCommand approval was deferred until the clarification is answered. Request it again in a later turn.");
@@ -1453,7 +1509,7 @@ pub async fn execute(mut plan: TeamPlan, emitter: Emitter, cancel: CancellationT
                 event: StageEvent::Update(Update::Output(visible.clone())),
             })
             .await;
-            if let Some(session_id) = session {
+            if let Some(session_id) = session.filter(|_| plan.agents[&mail.to].can_read_workspace) {
                 let session = AgentSession {
                     provider,
                     session_id,
@@ -1572,6 +1628,7 @@ pub async fn execute(mut plan: TeamPlan, emitter: Emitter, cancel: CancellationT
             .await;
         }
         failed |= status == Status::Failed;
+        if coworker(&plan.chat, mail.to).can_read_workspace {
         let path = plan.workspace.clone();
         let previous = plan.changes.clone();
         let owner = mail.to;
@@ -1587,6 +1644,7 @@ pub async fn execute(mut plan: TeamPlan, emitter: Emitter, cancel: CancellationT
                 changes,
             })
             .await;
+        }
         let asks = status == Status::Completed && (question.is_some() || approval.is_some());
         {
             let mut board = plan.control.0.lock().unwrap();
@@ -1751,6 +1809,39 @@ pub async fn execute(mut plan: TeamPlan, emitter: Emitter, cancel: CancellationT
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn access_changes_reset_only_the_owner_and_cancel_old_mail() {
+        let mut chat = empty_chat(); let owner = worker(Provider::Codex, "Alex"); let other = worker(Provider::Codex, "Noah");
+        let legacy = serde_json::to_value(&owner).unwrap(); let mut legacy = legacy.as_object().unwrap().clone(); legacy.remove("can_read_workspace");
+        assert!(serde_json::from_value::<Coworker>(serde_json::Value::Object(legacy)).unwrap().can_read_workspace);
+        chat.coworkers = vec![owner.clone(), other.clone()];
+        chat.sessions = vec![AgentSession { provider: Provider::Codex, coworker_id: Some(owner.id), session_id: "old-code-session".into(), scope: "same".into() }, AgentSession { provider: Provider::Codex, coworker_id: Some(other.id), session_id: "other-session".into(), scope: "same".into() }];
+        chat.mailbox = vec![Mail::new(Some(other.id), owner.id, "Old repository excerpts".into(), MailKind::Reply, None), Mail::new(None, other.id, "Keep working".into(), MailKind::User, None)];
+        let mut edited = owner; edited.can_read_workspace = false; edited.access_changed_at = None;
+        change_access(&mut chat, &mut edited, true);
+        assert!(edited.access_changed_at.is_some()); assert_eq!(chat.sessions.len(), 1); assert_eq!(chat.sessions[0].coworker_id, Some(other.id));
+        assert_eq!(chat.mailbox[0].state, MailState::Cancelled); assert_eq!(chat.mailbox[1].state, MailState::Queued);
+        chat.coworkers[0] = edited.clone();
+        let mut stale = edited; stale.can_read_workspace = true; stale.model = "new-model".into();
+        change_access(&mut chat, &mut stale, false);
+        assert!(!stale.can_read_workspace); assert_eq!(stale.model, "new-model");
+    }
+    #[test]
+    fn snippets_context_excludes_shared_and_pre_access_change_messages() {
+        let mut chat = empty_chat(); let mut owner = worker(Provider::Claude, "Maya"); let other = worker(Provider::Codex, "Alex");
+        owner.can_read_workspace = false;
+        let mut old = ChatMessage::new("assistant", Some(owner.provider), vec![], "OLD_CODE_CONTEXT".into()); old.author_id = Some(owner.id);
+        owner.access_changed_at = Some(old.at); // Deliberately collide timestamps.
+        owner.blocked_message_ids = vec![old.id];
+        let mut shared = ChatMessage::new("assistant", Some(other.provider), vec![], "UNADDRESSED_CODE".into()); shared.author_id = Some(other.id);
+        let mut snippet = ChatMessage::new("teammate_request", Some(other.provider), vec![], "EXPLICIT_SNIPPET".into()); snippet.author_id = Some(other.id); snippet.recipient_ids = vec![owner.id];
+        chat.coworkers = vec![owner.clone(), other]; chat.messages = vec![old, shared, snippet];
+        let mail = Mail::new(None, owner.id, "CURRENT_MESSAGE".into(), MailKind::User, None);
+        let plan = TeamPlan { run_id: Uuid::new_v4(), original: "ORIGINAL_PRIVATE_TASK".into(), workspace: "/private/project".into(), control: Control::new(&chat), chat, agents: HashMap::new(), unavailable: HashMap::new(), changes: None };
+        let prompt = context(&plan, &mail);
+        for secret in ["OLD_CODE_CONTEXT", "UNADDRESSED_CODE", "ORIGINAL_PRIVATE_TASK", "/private/project"] { assert!(!prompt.contains(secret)); }
+        assert!(prompt.contains("EXPLICIT_SNIPPET")); assert!(prompt.contains("CURRENT_MESSAGE"));
+    }
     fn empty_chat() -> Conversation {
         serde_json::from_value(serde_json::json!({ "members": ["codex"], "lead": "codex", "messages": [], "sessions": [] })).unwrap()
     }
@@ -1763,6 +1854,9 @@ mod tests {
             role: Role::Builder,
             model: String::new(),
             effort: Effort::Default,
+            can_read_workspace: true,
+            access_changed_at: None,
+            blocked_message_ids: vec![],
             attention: Attention::Idle,
             waiting_for: None,
             review_id: None,
