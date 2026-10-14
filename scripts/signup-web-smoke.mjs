@@ -31,9 +31,8 @@ try {
     await new Promise(resolve => setTimeout(resolve, 50));
   }
   assert(ready, `Fixture server did not start: ${log}`);
-  const expected = chromium.executablePath();
-  const chrome = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
-  const executablePath = process.env.CONDUCTOR_CHROMIUM_EXECUTABLE || (existsSync(expected) ? expected : existsSync(chrome) ? chrome : undefined);
+  const executablePath = process.env.CONDUCTOR_CHROMIUM_EXECUTABLE || chromium.executablePath();
+  assert(existsSync(executablePath), 'Install the pinned browser with frontend/node_modules/.bin/playwright install chromium, or explicitly set CONDUCTOR_CHROMIUM_EXECUTABLE.');
   browser = await chromium.launch({ headless: true, executablePath });
   for (const allowed of [false, true]) {
     const context = await browser.newContext({ viewport: { width: 900, height: 800 }, serviceWorkers: 'block' });

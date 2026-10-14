@@ -65,12 +65,30 @@ const history = page => page.evaluate(() => new Promise((resolve, reject) => {
   request.onerror = () => reject(request.error);
 }));
 async function saved(page) { await page.waitForFunction(() => document.querySelector('.offline-tools')?.textContent.includes('Clear offline copy')); }
+async function restoreConnection(context, page, selector) {
+  await context.setOffline(false);
+  // Restoring emulated transport can race the online event in Chromium.
+  // Exercise the app's recovery button if the first connectivity check failed.
+  await page.waitForFunction(selector => {
+    const field = document.querySelector(selector);
+    return (field && !field.disabled) || [...document.querySelectorAll('button')].some(button => button.textContent.trim() === 'Reconnect' && !button.disabled);
+  }, selector);
+  await page.evaluate(() => {
+    const retry = [...document.querySelectorAll('button')].find(button => button.textContent.trim() === 'Reconnect' && !button.disabled);
+    retry?.click();
+  });
+  await page.waitForFunction(selector => {
+    const field = document.querySelector(selector);
+    return field && !field.disabled;
+  }, selector);
+}
 try {
   let ready = false;
   for (let i = 0; i < 100; i++) { try { ready = (await fetch(origin)).ok; } catch {} if (ready) break; if (server.exitCode !== null) throw new Error(log); await new Promise(resolve => setTimeout(resolve, 50)); }
   assert(ready, log);
-  const expected = chromium.executablePath(), chrome = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
-  browser = await chromium.launch({ headless: true, executablePath: process.env.CONDUCTOR_CHROMIUM_EXECUTABLE || (existsSync(expected) ? expected : existsSync(chrome) ? chrome : undefined) });
+  const executablePath = process.env.CONDUCTOR_CHROMIUM_EXECUTABLE || chromium.executablePath();
+  assert(existsSync(executablePath), 'Install the pinned browser with frontend/node_modules/.bin/playwright install chromium, or explicitly set CONDUCTOR_CHROMIUM_EXECUTABLE.');
+  browser = await chromium.launch({ headless: true, executablePath });
   const context = await browser.newContext({ viewport: { width: 1440, height: 1000 } });
   const page = await context.newPage(), errors = [];
   page.on('pageerror', error => errors.push(error.message));
@@ -87,8 +105,7 @@ try {
   await page.getByText('You’re offline', { exact: true }).waitFor();
   assert(await page.getByRole('button', { name: 'Sign in', exact: true }).isDisabled());
   assert.equal(await history(page), null);
-  await context.setOffline(false); await page.getByRole('button', { name: 'Sign in', exact: true }).waitFor({ state: 'visible' });
-  await page.waitForFunction(() => !document.querySelector('form button.primary')?.disabled);
+  await restoreConnection(context, page, 'form button.primary');
   async function login() {
     await page.getByLabel('Email', { exact: true }).fill(`${account}@example.test`);
     await page.getByLabel('Password', { exact: true }).fill('fixture-password-1234');
@@ -122,7 +139,7 @@ try {
   const output = path.resolve('target/remote-web'); await mkdir(output, { recursive: true });
   assert.equal(await page.locator('.app').count(), 1);
   await page.locator('.workspace').screenshot({ path: path.join(output, 'pwa-offline.png') });
-  await context.setOffline(false); await page.waitForFunction(() => !document.querySelector('textarea[aria-label="Message"]')?.disabled);
+  await restoreConnection(context, page, 'textarea[aria-label="Message"]');
   await page.getByRole('button', { name: 'Sign out', exact: true }).click();
   await page.getByRole('button', { name: 'Sign in', exact: true }).waitFor(); assert.equal(await history(page), null);
   // Cached history is discarded when a live session is rejected or belongs to another account.
